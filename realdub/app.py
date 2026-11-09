@@ -10,7 +10,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QSizeGrip, QVBoxLayout, QWidget)
 
-from realdub import config
+from realdub import __version__, config
 from realdub.audio import Capture, Segmenter
 
 STYLE = """
@@ -35,7 +35,7 @@ class Overlay(QWidget):
         super().__init__()
         self.cfg, self.bus = cfg, bus
         self.lines, self.partial = [], {}
-        self.setWindowTitle("RealDub")
+        self.setWindowTitle(f"RealDub v{__version__}")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(STYLE % int(cfg["opacity"] * 255))
@@ -51,7 +51,7 @@ class Overlay(QWidget):
         lay.setContentsMargins(14, 10, 14, 10)
 
         bar = QHBoxLayout()
-        title = QLabel("🌐 RealDub")
+        title = QLabel(f"🌐 RealDub v{__version__}")
         title.setStyleSheet("font-weight:600; font-size:14px; color:#9fb4ff;")
         bar.addWidget(title)
         self.st = QLabel("Завантаження моделей…")
