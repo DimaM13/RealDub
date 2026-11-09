@@ -16,7 +16,55 @@ for _sp in site.getsitepackages():
         os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
 
 JUNK = {"", "you", "thank you.", "thanks for watching!", "дякую.", "дякую за перегляд!",
-        "субтитри зроблені спільнотою amara.org"}
+        "субтитри зроблені спільнотою amara.org", "thank you", "дякую", "bye.", "bye", "бувайте."}
+
+QUESTION_STARTERS = {
+    "en": ("what", "who", "where", "when", "why", "how", "can", "could", "would", "should", "is", "are", "do", "does", "did", "will", "have", "has"),
+    "uk": ("чи", "як", "де", "коли", "чому", "хто", "що", "який", "яка", "яке", "які", "куди", "звідки", "навіщо"),
+}
+
+
+def prepare_audio(audio: np.ndarray) -> np.ndarray:
+    """Видаляє постійне зміщення без штучного посилення фонового шуму."""
+    if len(audio) == 0:
+        return audio
+    return (audio - float(np.mean(audio))).astype(np.float32)
+
+
+def remove_repetitions(text: str) -> str:
+    """Виявляє та видаляє циклічні галюцинації Whisper (коли одна фраза повторюється поспіль)."""
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) < 6:
+        return text
+    # Перевіряємо повторення n-грам від 2 до 10 слів
+    for n in range(2, min(12, len(words) // 2 + 1)):
+        for i in range(len(words) - 2 * n + 1):
+            pattern = words[i:i + n]
+            if words[i + n:i + 2 * n] == pattern:
+                # Знайдено точний цикл — повертаємо лише очищену частину без зациклення
+                return " ".join(words[:i + n])
+    return text
+
+
+def clean_text(text: str) -> str:
+    """Виправляє пунктуацію, апострофи, прибирає галюцинації та повтори."""
+    if not text:
+        return ""
+    text = remove_repetitions(text)
+    # Прибираємо пробіли перед знаками пунктуації
+    text = re.sub(r"\s+([,.:;!?…])", r"\1", text)
+    # З'єднуємо розірвані апострофи в українських словах
+    text = re.sub(r"(\w)\s*[''`’]\s*(\w)", r"\1'\2", text)
+    # Прибираємо зайві пробіли всередині лапок та дужок
+    text = re.sub(r'([«"“(\[])\s+', r"\1", text)
+    text = re.sub(r'\s+([»"”)\]])', r"\1", text)
+    # Нормалізуємо пробіли
+    text = re.sub(r"\s+", " ", text).strip()
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    return text
 
 
 def _cuda() -> bool:
@@ -42,12 +90,23 @@ class Recognizer:
         self.lock = threading.Lock()
 
     def __call__(self, audio: np.ndarray, lang: str) -> str:
+        audio = prepare_audio(audio)
         with self.lock:
-            segs, _ = self.model.transcribe(audio, language=lang, beam_size=1,
-                                            temperature=0.0,  # без повторних декодувань
-                                            condition_on_previous_text=False,
-                                            without_timestamps=True, vad_filter=False)
+            segs, _ = self.model.transcribe(
+                audio,
+                language=lang,
+                beam_size=1,
+                temperature=0.0,
+                initial_prompt=None,  # вимкнено для запобігання галюцинаціям
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=250, speech_pad_ms=80),
+                compression_ratio_threshold=2.2,
+                no_speech_threshold=0.6,
+            )
             text = " ".join(s.text.strip() for s in segs if s.no_speech_prob < 0.6).strip()
+        text = clean_text(text)
         return "" if text.lower() in JUNK else text
 
 
@@ -68,16 +127,38 @@ class NLLB:
 
     def make(self, src: str, dst: str):
         s, t = NLLB_CODES[src], NLLB_CODES[dst]
+        starters = QUESTION_STARTERS.get(src, ())
 
-        def run(text: str) -> str:
-            sents = [x for x in re.split(r"(?<=[.!?…])\s+", text.strip()) if x]
+        def run(text: str, fast: bool = False) -> str:
+            text = text.strip()
+            if not text:
+                return ""
+            sents = [x for x in re.split(r"(?<=[.!?…])\s+", text) if x]
             if not sents:
                 return ""
-            toks = [[s] + self.sp.encode(x, out_type=str) + ["</s>"] for x in sents]
+
+            # Якщо речення не має розділового знаку, додаємо його для кращої синтаксичної побудови
+            prepared = []
+            for s_item in sents:
+                clean_s = s_item.strip()
+                if clean_s and clean_s[-1] not in ".!?…":
+                    first_w = clean_s.split()[0].lower().strip(".,:;!?")
+                    clean_s += "?" if first_w in starters else "."
+                prepared.append(clean_s)
+
+            toks = [[s] + self.sp.encode(x, out_type=str) + ["</s>"] for x in prepared]
+            beam = 1 if fast else 2
             with self.lock:
-                res = self.tr.translate_batch(toks, target_prefix=[[t]] * len(toks), beam_size=2,
-                                              max_decoding_length=200, repetition_penalty=1.1)
-            return " ".join(self.sp.decode([p for p in r.hypotheses[0] if p != t]) for r in res).strip()
+                res = self.tr.translate_batch(
+                    toks,
+                    target_prefix=[[t]] * len(toks),
+                    beam_size=beam,
+                    max_decoding_length=180,
+                    repetition_penalty=1.15,
+                )
+            decoded = " ".join(self.sp.decode([p for p in r.hypotheses[0] if p != t]) for r in res)
+            return clean_text(decoded)
+
         return run
 
 

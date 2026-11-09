@@ -65,7 +65,7 @@ class Segmenter:
         if self.silent >= self.sil_frames:
             audio = np.concatenate(self.buf)
             self.speech, self.buf, self.levels, self.pre, self.voiced = False, [], [], [], 0
-            if size > SR * 0.5:
+            if size >= int(SR * 0.3):  # розпізнаємо навіть короткі слова на кшталт "Yes", "Так"
                 self.on_phrase(audio, True)
         elif size >= self.max_len:
             # Безперервне мовлення: ріжемо в найтихішому місці останніх ~1.2 с, решта йде далі
@@ -75,7 +75,7 @@ class Segmenter:
             self.buf, self.levels = self.buf[cut:], self.levels[cut:]
             self.last_partial = time.time()
             self.on_phrase(audio, True)
-        elif self.partial and size > SR * 0.8 and time.time() - self.last_partial > 0.6:
+        elif self.partial and size >= int(SR * 0.6) and time.time() - self.last_partial > 0.5:
             self.last_partial = time.time()
             self.on_phrase(np.concatenate(self.buf), False)
 

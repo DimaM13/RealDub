@@ -128,16 +128,24 @@ class Overlay(QWidget):
 
     def _render(self):
         fs = self.cfg["font_size"]
+
         def block(d, o, t, live=False):
-            color = "#ffffff" if d == "in" else "#7dffb2"
-            tag = "EN→UK" if d == "in" else "UK→EN"
-            op = "0.6" if live else "1"
-            return (f"<div style='margin-bottom:6px; opacity:{op}'>"
-                    f"<span style='color:#7d869a; font-size:{fs - 8}pt'>{tag} · {_esc(o)}</span><br>"
-                    f"<span style='color:{color}; font-size:{fs}pt'>{_esc(t)}{' …' if live else ''}</span></div>")
+            color = "#ffffff" if d == "in" else "#68ffa8"
+            tag = "EN → UK" if d == "in" else "UK → EN"
+            op = "0.75" if live else "1.0"
+            live_badge = "<span style='color:#f59e0b; font-size:11px; font-weight:600;'> ⚡ мовлення…</span>" if live else ""
+            return (
+                f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
+                f"<span style='color:#94a3b8; font-size:{max(11, fs - 7)}pt;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
+                f"<span style='color:{color}; font-size:{fs}pt; font-weight:500;'>{_esc(t)}</span>"
+                f"</div>"
+            )
+
         html = "".join(block(*l[:3]) for l in self.lines)
         html += "".join(block(d, o, t, True) for d, (o, t) in self.partial.items())
-        self.text.setText(html or f"<span style='color:#7d869a; font-size:{fs - 6}pt'>Очікую на мовлення…</span>")
+        self.text.setText(
+            html or f"<span style='color:#64748b; font-size:{max(12, fs - 5)}pt;'>Очікую на мовлення… Говоріть у мікрофон або увімкніть звук ПК.</span>"
+        )
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -232,16 +240,35 @@ class Pipeline:
     def _loop(self, d):
         lane = self.lanes[d]
         mt = self.en_uk if d == "in" else self.uk_en
+        last_partial_orig = ""
         while True:
             audio, final = lane.get()
             try:
                 t0 = time.time()
                 orig = self.asr(audio, "en" if d == "in" else "uk")
                 if not final and lane.finals:
-                    continue  # поки розпізнавали, фраза вже завершилась
+                    continue  # поки розпізнавали, фраза вже завершилась, обробляємо фінальну
                 if not orig:
+                    if final:
+                        last_partial_orig = ""
                     continue
-                self._emit(d, orig, mt(orig), final)
+
+                if not final:
+                    if orig == last_partial_orig:
+                        continue  # текст не змінився, уникаємо зайвого навантаження GPU
+                    last_partial_orig = orig
+                    try:
+                        tr = mt(orig, fast=True)
+                    except TypeError:
+                        tr = mt(orig)
+                else:
+                    last_partial_orig = ""
+                    try:
+                        tr = mt(orig, fast=False)
+                    except TypeError:
+                        tr = mt(orig)
+
+                self._emit(d, orig, tr, final)
                 if final:
                     self.bus.status.emit(f"✅ {self.asr.device} · затримка {time.time() - t0:.1f} с")
             except Exception as e:
