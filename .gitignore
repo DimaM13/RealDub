@@ -1,6 +1,10 @@
 .venv/
+**/.venv/
 models/
+**/models/
 __pycache__/
+**/__pycache__/
 *.pyc
 config.json
+**/config.json
 err.txt
