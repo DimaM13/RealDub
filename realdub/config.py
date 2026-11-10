@@ -25,13 +25,15 @@ DEFAULTS = {
     "opacity": 0.82,
     "max_lines": 4,
     # Через скільки секунд застарілі рядки стають прозорими (0 = не зникають)
-    "line_ttl_sec": 60,
+    "line_ttl_sec": 120,
+    # Автоматично вмикати захоплення звуку ПК при запуску
+    "auto_listen_system": True,
     # Автоматично перевіряти оновлення на GitHub при старті
     "check_updates_on_start": True,
 }
 
 # Версія налаштувань: при зміні старий config.json оновлюється новими типовими значеннями
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 # Голоси Piper (офлайн синтез мовлення)
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"

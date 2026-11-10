@@ -93,8 +93,28 @@ QProgressBar::chunk {
 """
 
 
+def get_desktop_dirs() -> list[Path]:
+    """Повертає реальні шляхи до Робочого столу Windows (включно з OneDrive)."""
+    dirs = []
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        # CSIDL_DESKTOPDIRECTORY = 0x0010
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0 and buf.value:
+            p = Path(buf.value)
+            if p.exists():
+                dirs.append(p)
+    except Exception:
+        pass
+    fallback = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+    if fallback.exists() and fallback not in dirs:
+        dirs.append(fallback)
+    return dirs
+
+
 def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, working_dir: str, description: str):
-    """Створює Windows .lnk ярлик через PowerShell."""
+    """Створює Windows .lnk ярлик через PowerShell (-EncodedCommand для підтримки кирилиці)."""
+    import base64
     ps_cmd = (
         f"$ws = New-Object -ComObject WScript.Shell; "
         f"$s = $ws.CreateShortcut('{shortcut_path}'); "
@@ -104,7 +124,12 @@ def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, work
         f"$s.Description = '{description}'; "
         f"$s.Save()"
     )
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True)
+    encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-EncodedCommand", encoded],
+        capture_output=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
 
 
 class InstallWorker(threading.Thread):
@@ -180,25 +205,23 @@ class InstallWorker(threading.Thread):
             uninst_file = self.target / "uninstall.bat"
             uninst_content = (
                 "@echo off\n"
-                "chcp 65001 >nul\n"
-                "echo Видалити RealDub з вашого комп'ютера? [Y/N]\n"
+                "echo Uninstall RealDub? [Y/N]\n"
                 "set /p choice=\n"
                 'if /i "%choice%"=="Y" (\n'
                 '  del /q "%USERPROFILE%\\Desktop\\RealDub.lnk" 2>nul\n'
                 '  del /q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\RealDub.lnk" 2>nul\n'
                 '  cd /d "%TEMP%"\n'
                 f'  rmdir /s /q "{self.target}"\n'
-                '  echo RealDub успішно видалено.\n'
+                '  echo RealDub uninstalled.\n'
                 ")\n"
                 "pause\n"
             )
-            uninst_file.write_text(uninst_content, encoding="utf-8")
+            uninst_file.write_text(uninst_content, encoding="ascii", errors="ignore")
 
             # Створення ярликів
             self.on_step("Створюю ярлики на комп'ютері…", 95)
             if self.desktop_sc:
-                desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-                if desktop.exists():
+                for desktop in get_desktop_dirs():
                     create_windows_shortcut(
                         target_exe=venv_pythonw,
                         args="main.pyw",
@@ -219,7 +242,7 @@ class InstallWorker(threading.Thread):
                     )
 
             self.on_step("Встановлення завершено!", 100)
-            self.on_done(str(self.target / "start.bat"))
+            self.on_done(str(self.target))
         except Exception as e:
             self.on_error(str(e))
 
@@ -385,7 +408,12 @@ def run_gui():
     def on_finish():
         if cb_launch.isChecked() and final_start_bat[0]:
             try:
-                os.startfile(final_start_bat[0])
+                t_dir = Path(final_start_bat[0])
+                pw = t_dir / ".venv" / "Scripts" / "pythonw.exe"
+                if pw.exists():
+                    subprocess.Popen([str(pw), str(t_dir / "main.pyw")], cwd=str(t_dir))
+                else:
+                    os.startfile(str(t_dir / "start.bat"))
             except Exception:
                 pass
         window.close()

@@ -17,16 +17,27 @@ API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 TAGS_URL = f"https://api.github.com/repos/{GITHUB_REPO}/tags"
 ZIP_URL = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip"
 
+_NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _run_git(args: list[str], cwd: Path = None, timeout: int = 10):
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=_NO_WIN,
+    )
+
 
 def parse_version(v_str: str) -> tuple:
-    """Перетворює рядок версії на зразок 'v2.1.1' у кортеж чисел для порівняння (2, 1, 1)."""
+    """Перетворює рядок версії на зразок 'v2.1.2' у кортеж чисел для порівняння (2, 1, 2)."""
     clean = v_str.strip().lstrip("vV")
     parts = []
     for x in clean.split("."):
-        try:
-            parts.append(int(x))
-        except ValueError:
-            parts.append(0)
+        m = re.match(r"(\d+)", x)
+        parts.append(int(m.group(1)) if m else 0)
     return tuple(parts)
 
 
@@ -36,51 +47,39 @@ def check_for_updates(current_version: str, target_dir: Path = None) -> dict | N
     if target_dir is None:
         target_dir = Path(__file__).resolve().parent.parent
 
-    # 1. Якщо у папці є .git — перевіряємо через локальний git
-    git_dir = target_dir / ".git"
-    if git_dir.exists():
-        try:
-            subprocess.run(["git", "fetch", "origin", "main", "--quiet"], cwd=str(target_dir), timeout=6)
-            res = subprocess.run(
-                ["git", "rev-list", "HEAD..origin/main", "--count"],
-                cwd=str(target_dir),
-                capture_output=True,
-                text=True,
-                timeout=4,
-            )
-            behind_count = int(res.stdout.strip() or "0")
-            if behind_count > 0:
-                return {
-                    "version": f"v2.1.1 (+{behind_count} змін)",
-                    "name": "Нова версія на GitHub",
-                    "body": f"Доступно {behind_count} нових оновлень у гілці main.",
-                    "method": "git",
-                }
-        except Exception:
-            pass
-
-    # 2. Якщо .git немає, але в системі є Git — перевіряємо віддалені теги через git ls-remote
+    # 1. Перевіряємо віддалені теги через git ls-remote (працює навіть без локального .git)
     try:
-        res = subprocess.run(
-            ["git", "ls-remote", "--tags", REPO_URL],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
+        res = _run_git(["ls-remote", "--tags", REPO_URL], timeout=8)
         if res.returncode == 0 and res.stdout:
-            tags = re.findall(r"refs/tags/(v\d+\.\d+\.\d+)", res.stdout)
+            tags = re.findall(r"refs/tags/(v\d+\.\d+(?:\.\d+)?)", res.stdout)
             if tags:
-                # Знаходимо найвищу версію серед тегів
                 best_tag = max(set(tags), key=parse_version)
                 if parse_version(best_tag) > parse_version(current_version):
                     return {
                         "version": best_tag,
                         "name": f"Реліз {best_tag}",
-                        "body": "Виправлено зависання звуку, покращено збереження повідомлень та стабільність.",
+                        "body": "Доступна нова версія з покращеннями стабільності та швидкодії.",
                         "method": "git_remote",
                     }
     except Exception:
         pass
+
+    # 2. Якщо у папці є .git — перевіряємо нові коміти у гілці main
+    git_dir = target_dir / ".git"
+    if git_dir.exists():
+        try:
+            _run_git(["fetch", "origin", "main", "--quiet"], cwd=target_dir, timeout=6)
+            res = _run_git(["rev-list", "HEAD..origin/main", "--count"], cwd=target_dir, timeout=4)
+            behind_count = int(res.stdout.strip() or "0")
+            if behind_count > 0:
+                return {
+                    "version": f"+{behind_count} оновлень",
+                    "name": "Нові зміни на GitHub",
+                    "body": f"Доступно {behind_count} нових комітів у гілці main.",
+                    "method": "git",
+                }
+        except Exception:
+            pass
 
     # 3. Через публічний GitHub API
     headers = {"User-Agent": "RealDub-App"}
@@ -113,42 +112,31 @@ def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
         if on_progress:
             on_progress(msg)
 
-    # 1. Якщо у папці є .git — швидкий git pull
     git_dir = target_dir / ".git"
-    if git_dir.exists():
-        try:
-            report("Оновлюю файли через Git...")
-            res = subprocess.run(
-                ["git", "pull", "origin", "main"],
-                cwd=str(target_dir),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if res.returncode == 0:
-                return True, "✅ Оновлено через Git! Будь ласка, перезапустіть RealDub."
-        except Exception:
-            pass
 
-    # 2. Якщо .git немає, але в системі є Git — підключаємося до репозиторію та оновлюємо код
+    # 1. Оновлюємо код через Git (працює і для приватного, і для публічного репозиторію)
     try:
-        report("Синхронізую файли через Git...")
+        report("Синхронізую файли з GitHub...")
         if not git_dir.exists():
-            subprocess.run(["git", "init"], cwd=str(target_dir), capture_output=True)
-            subprocess.run(["git", "remote", "add", "origin", REPO_URL], cwd=str(target_dir), capture_output=True)
-        subprocess.run(["git", "fetch", "origin", "main", "--quiet"], cwd=str(target_dir), timeout=25)
-        # Оновлюємо виключно файли програми, не зачіпаючи models/ та config.json
-        subprocess.run(
-            ["git", "checkout", "origin/main", "--", "realdub", "main.pyw", "download_models.py", "requirements.txt", "start.bat", "README.md"],
-            cwd=str(target_dir),
-            capture_output=True,
-            timeout=20,
-        )
-        return True, "✅ Програму успішно оновлено! Перезапустіть RealDub."
+            _run_git(["init"], cwd=target_dir, timeout=5)
+            _run_git(["remote", "add", "origin", REPO_URL], cwd=target_dir, timeout=5)
+        else:
+            _run_git(["remote", "set-url", "origin", REPO_URL], cwd=target_dir, timeout=5)
+
+        fetch_res = _run_git(["fetch", "origin", "main", "--quiet"], cwd=target_dir, timeout=25)
+        if fetch_res.returncode == 0:
+            chk_res = _run_git(
+                ["checkout", "origin/main", "--", "realdub", "main.pyw", "download_models.py", "requirements.txt", "start.bat", "README.md"],
+                cwd=target_dir,
+                timeout=20,
+            )
+            if chk_res.returncode == 0:
+                _run_git(["reset", "--mixed", "origin/main"], cwd=target_dir, timeout=5)
+                return True, "✅ Оновлено! Перезапускаю RealDub…"
     except Exception:
         pass
 
-    # 3. Резервний спосіб через ZIP (якщо репозиторій відкритий)
+    # 2. Резервний спосіб через ZIP (якщо репозиторій відкритий)
     try:
         report("Завантажую архів оновлення з GitHub...")
         headers = {"User-Agent": "RealDub-App"}
@@ -176,6 +164,6 @@ def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
                 with zf.open(member) as src_f, open(dest_file, "wb") as dst_f:
                     shutil.copyfileobj(src_f, dst_f)
 
-        return True, "✅ Оновлення успішно встановлено! Перезапустіть RealDub."
+        return True, "✅ Оновлено! Перезапускаю RealDub…"
     except Exception as e:
         return False, f"❌ Помилка оновлення: {e}"

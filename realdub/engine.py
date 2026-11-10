@@ -1,5 +1,5 @@
 """ШІ-рушій: Faster-Whisper, NLLB-200, Piper TTS.
-Кросплатформна оптимізація для Windows (NVIDIA CUDA / CPU), macOS (Apple Silicon / Intel) та Linux."""
+Оптимізовано для Windows (NVIDIA CUDA або процесор)."""
 import io
 import os
 import re
@@ -27,8 +27,13 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     except Exception:
         pass
 
-JUNK = {"", "you", "thank you.", "thanks for watching!", "дякую.", "дякую за перегляд!",
-        "субтитри зроблені спільнотою amara.org", "thank you", "дякую", "bye.", "bye", "бувайте."}
+JUNK = {
+    "", "you", "thank you", "thanks for watching", "дякую", "дякую за перегляд",
+    "субтитри зроблені спільнотою amara.org", "bye", "бувайте",
+    "ah", "oh", "uh", "um", "hmm", "mm", "eh", "ha", "ooh", "aah", "huh", "whoa", "yo",
+    "а", "о", "е", "у", "м", "угу", "ага", "ем", "хм",
+    "продовження буде", "далі буде", "підписуйтесь на канал",
+}
 
 QUESTION_STARTERS = {
     "en": ("what", "who", "where", "when", "why", "how", "can", "could", "would", "should", "is", "are", "do", "does", "did", "will", "have", "has"),
@@ -120,7 +125,10 @@ class Recognizer:
             )
             text = " ".join(s.text.strip() for s in segs if s.no_speech_prob < 0.6).strip()
         text = clean_text(text)
-        return "" if text.lower() in JUNK else text
+        norm = text.lower().strip(" .,!?:;…\"'«»()-")
+        if norm in JUNK or len(re.sub(r"[^a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]", "", norm)) < 2:
+            return ""
+        return text
 
 
 NLLB_CODES = {"en": "eng_Latn", "uk": "ukr_Cyrl"}
