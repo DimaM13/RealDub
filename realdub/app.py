@@ -163,15 +163,23 @@ class Overlay(QWidget):
     def _on_line(self, direction, orig, trans, final):
         if final:
             self.partial.pop(direction, None)
-            self.lines.append((direction, orig, trans, time.time()))
-            self.lines = self.lines[-self.cfg["max_lines"]:]
+            if orig and trans:
+                self.lines.append((direction, orig, trans, time.time()))
+                self.lines = self.lines[-self.cfg.get("max_lines", 4):]
         else:
-            self.partial[direction] = (orig, trans)
+            if orig and trans:
+                self.partial[direction] = (orig, trans)
         self._render()
 
     def _expire(self):
-        ttl = self.cfg["line_ttl_sec"]
-        keep = [l for l in self.lines if time.time() - l[3] < ttl]
+        ttl = self.cfg.get("line_ttl_sec", 60)
+        if ttl <= 0 or not self.lines:
+            return
+        now = time.time()
+        keep = [l for l in self.lines if now - l[3] < ttl]
+        # Ніколи не стираємо останній рядок у нуль — екран завжди залишається інформативним
+        if not keep and self.lines:
+            keep = [self.lines[-1]]
         if len(keep) != len(self.lines):
             self.lines = keep
             self._render()
@@ -192,7 +200,7 @@ class Overlay(QWidget):
             )
 
         html = "".join(block(*l[:3]) for l in self.lines)
-        html += "".join(block(d, o, t, True) for d, (o, t) in self.partial.items())
+        html += "".join(block(d, o, t, True) for d, (o, t) in self.partial.items() if o and t)
         self.text.setText(
             html or f"<span style='color:#64748b; font-size:{max(12, fs - 5)}pt;'>Очікую на мовлення… Говоріть у мікрофон або увімкніть звук ПК.</span>"
         )
@@ -200,13 +208,16 @@ class Overlay(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            e.accept()
 
     def mouseMoveEvent(self, e):
-        if self._drag is not None:
+        if self._drag is not None and (e.buttons() & Qt.LeftButton):
             self.move(e.globalPosition().toPoint() - self._drag)
+            e.accept()
 
     def mouseReleaseEvent(self, e):
         self._drag = None
+        e.accept()
 
 
 def _esc(s):
@@ -312,6 +323,7 @@ class Pipeline:
                 if not orig:
                     if final:
                         last_partial_orig = ""
+                        self.bus.line.emit(d, "", "", True)
                     continue
 
                 if not final:

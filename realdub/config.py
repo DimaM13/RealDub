@@ -23,15 +23,15 @@ DEFAULTS = {
     "live_partial": True,
     "font_size": 20,
     "opacity": 0.82,
-    "max_lines": 3,
-    # Через скільки секунд старий рядок зникає
-    "line_ttl_sec": 15,
+    "max_lines": 4,
+    # Через скільки секунд застарілі рядки стають прозорими (0 = не зникають)
+    "line_ttl_sec": 60,
     # Автоматично перевіряти оновлення на GitHub при старті
     "check_updates_on_start": True,
 }
 
 # Версія налаштувань: при зміні старий config.json оновлюється новими типовими значеннями
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # Голоси Piper (офлайн синтез мовлення)
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
