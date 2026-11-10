@@ -7,11 +7,12 @@ import time
 import numpy as np
 from PySide6.QtCore import QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QSizeGrip, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                               QPushButton, QSizeGrip, QVBoxLayout, QWidget)
 
 from realdub import __version__, config
 from realdub.audio import Capture, Segmenter
+from realdub.updater import apply_update, check_for_updates
 
 STYLE = """
 #panel { background: rgba(14,16,24,%d); border-radius: 14px; border: 1px solid rgba(255,255,255,30); }
@@ -28,6 +29,7 @@ QLineEdit { color:white; background: rgba(255,255,255,20); border:none; border-r
 class Bus(QObject):
     line = Signal(str, str, str, bool)  # напрям, оригінал, переклад, фінальний
     status = Signal(str)
+    update_info = Signal(dict)
 
 
 class Overlay(QWidget):
@@ -57,17 +59,24 @@ class Overlay(QWidget):
         self.st = QLabel("Завантаження моделей…")
         self.st.setStyleSheet("color:#8a93a6; font-size:12px;")
         bar.addWidget(self.st, 1)
+
         self.b_sys = self._btn("🎧 Звук ПК  EN→UK", True)
         self.b_mic = self._btn("🎤 Мікрофон  UK→EN", True)
         self.b_tts = self._btn("🔊 Озвучувати", True)
         self.b_tts.setToolTip("Озвучувати англійський переклад моєї мови")
         for b in (self.b_sys, self.b_mic, self.b_tts):
             bar.addWidget(b)
+
+        self.b_upd = self._btn("🔄", False)
+        self.b_upd.setToolTip("Перевірити оновлення на GitHub")
+        self.b_upd.clicked.connect(self._on_update_click)
+        bar.addWidget(self.b_upd)
+
         clr = self._btn("🧹", False)
-        clr.setToolTip("Очистити")
+        clr.setToolTip("Очистити субтитри")
         clr.clicked.connect(self._clear)
         close = self._btn("✕", False)
-        close.setToolTip("Закрити")
+        close.setToolTip("Закрити програму")
         close.clicked.connect(QApplication.quit)
         bar.addWidget(clr)
         bar.addWidget(close)
@@ -89,10 +98,51 @@ class Overlay(QWidget):
 
         bus.line.connect(self._on_line)
         bus.status.connect(self.st.setText)
+        bus.update_info.connect(self._on_update_available)
+        self.latest_update = None
         self._drag = None
         self.on_typed = None
         self._timer = QTimer(self, interval=1000, timeout=self._expire)
         self._timer.start()
+
+    def _on_update_available(self, info: dict):
+        self.latest_update = info
+        self.b_upd.setStyleSheet("background:#10b981; color:white; font-weight:bold;")
+        self.b_upd.setToolTip(f"Доступна нова версія {info['version']}! Натисніть для оновлення.")
+        self.st.setText(f"Доступно оновлення {info['version']} (кнопка 🔄)")
+
+    def _on_update_click(self):
+        if self.latest_update:
+            ver = self.latest_update["version"]
+            desc = self.latest_update.get("body", "")
+            btn = QMessageBox.question(
+                self,
+                "Оновлення RealDub",
+                f"Доступна нова версія {ver}!\n\nОпис змін:\n{desc}\n\nОновити програму зараз?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if btn == QMessageBox.Yes:
+                self._run_update()
+        else:
+            self.st.setText("Перевіряю оновлення на GitHub…")
+            threading.Thread(target=self._manual_check_update, daemon=True).start()
+
+    def _manual_check_update(self):
+        info = check_for_updates(__version__)
+        if info:
+            self.bus.update_info.emit(info)
+        else:
+            self.bus.status.emit(f"У вас найновіша версія (v{__version__})")
+
+    def _run_update(self):
+        self.b_upd.setEnabled(False)
+        self.st.setText("Завантажую та встановлюю оновлення…")
+
+        def task():
+            ok, msg = apply_update(on_progress=self.bus.status.emit)
+            self.bus.status.emit(msg)
+
+        threading.Thread(target=task, daemon=True).start()
 
     def _btn(self, text, checkable):
         b = QPushButton(text)
@@ -201,18 +251,27 @@ class Pipeline:
         self.typed = queue.Queue()
         mk = lambda d: Segmenter(lambda a, f: self.lanes[d].put(a, f), cfg["min_level"],
                                  cfg["silence_sec"], cfg["max_phrase_sec"], cfg["live_partial"])
-        self.cap_sys = Capture("system", mk("in"))
-        self.cap_mic = Capture("mic", mk("out"))
+        self.cap_sys = Capture("system", mk("in"), cfg)
+        self.cap_mic = Capture("mic", mk("out"), cfg)
         ui.b_sys.toggled.connect(lambda v: setattr(self.cap_sys, "enabled", v))
         ui.b_mic.toggled.connect(lambda v: setattr(self.cap_mic, "enabled", v))
         ui.on_typed = self.typed.put
         threading.Thread(target=self._load, daemon=True).start()
 
+    def _check_update_bg(self):
+        try:
+            time.sleep(2)
+            info = check_for_updates(__version__)
+            if info:
+                self.bus.update_info.emit(info)
+        except Exception:
+            pass
+
     def _load(self):
         try:
             from realdub.engine import NLLB, Recognizer, Speaker, Translator
             self.asr = Recognizer(self.cfg)
-            gpu = self.asr.device == "відеокарта"
+            gpu = "GPU" in self.asr.device
             try:
                 nllb = NLLB(gpu)
                 self.en_uk, self.uk_en = nllb.make("en", "uk"), nllb.make("uk", "en")
@@ -222,12 +281,14 @@ class Pipeline:
             self.tts = Speaker(self.cfg)
             self.asr(np.zeros(16000, np.float32), "en")  # прогрів
         except StopIteration:
-            self.bus.status.emit("❌ Моделі не знайдено — запустіть install.bat")
+            self.bus.status.emit("❌ Моделі не знайдено — запустіть install.bat або installer")
             return
         except Exception as e:
             self.bus.status.emit(f"❌ Помилка: {e}")
             return
         self.bus.status.emit(f"✅ Готово · {self.asr.device} · офлайн")
+        if self.cfg.get("check_updates_on_start", True):
+            threading.Thread(target=self._check_update_bg, daemon=True).start()
         for d in ("in", "out"):
             threading.Thread(target=self._loop, args=(d,), daemon=True).start()
         threading.Thread(target=self._typed_loop, daemon=True).start()

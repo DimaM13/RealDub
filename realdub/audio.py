@@ -1,5 +1,5 @@
-"""Захоплення звуку: системний звук (WASAPI loopback) та мікрофон.
-Розбиття на фрази простим енергетичним детектором мовлення."""
+"""Захоплення звуку для Windows: системний звук комп'ютера (WASAPI loopback) та мікрофон.
+Розбиття на фрази з енергетичним детектором мовлення."""
 import threading
 import time
 
@@ -8,7 +8,7 @@ import pyaudiowpatch as pyaudio
 
 SR = 16000
 FRAME = 480  # 30 мс
-_PA = None  # один спільний екземпляр PortAudio
+_PA = None
 _PA_LOCK = threading.Lock()
 
 
@@ -51,7 +51,7 @@ class Segmenter:
         if not self.speech:
             self.floor = 0.97 * self.floor + 0.03 * min(rms, 0.05)
             self.pre.append(f)
-            self.pre = self.pre[-10:]  # 300 мс до початку мовлення
+            self.pre = self.pre[-10:]  # 300 мс перед початком мовлення
             self.voiced = self.voiced + 1 if loud else 0
             if self.voiced >= 3:
                 self.speech, self.buf, self.silent = True, list(self.pre), 0
@@ -65,10 +65,10 @@ class Segmenter:
         if self.silent >= self.sil_frames:
             audio = np.concatenate(self.buf)
             self.speech, self.buf, self.levels, self.pre, self.voiced = False, [], [], [], 0
-            if size >= int(SR * 0.3):  # розпізнаємо навіть короткі слова на кшталт "Yes", "Так"
+            if size >= int(SR * 0.3):  # розпізнаємо навіть короткі слова ("Yes", "Так")
                 self.on_phrase(audio, True)
         elif size >= self.max_len:
-            # Безперервне мовлення: ріжемо в найтихішому місці останніх ~1.2 с, решта йде далі
+            # Розрізаємо довгу фразу в найбільш тихому моменті останніх ~1.2 с
             tail = self.levels[-40:]
             cut = len(self.buf) - len(tail) + int(np.argmin(tail)) + 1
             audio = np.concatenate(self.buf[:cut])
@@ -81,12 +81,12 @@ class Segmenter:
 
 
 class Capture:
-    """Потік захоплення з пристрою. source: 'system' або 'mic'."""
+    """Потік захоплення звуку на Windows: WASAPI loopback для системи та мікрофон."""
 
-    def __init__(self, source: str, segmenter: Segmenter):
-        self.source, self.seg = source, segmenter
+    def __init__(self, source: str, segmenter: Segmenter, cfg: dict = None):
+        self.source, self.seg, self.cfg = source, segmenter, cfg or {}
         self.enabled = False
-        self.muted = False  # тимчасово (під час нашого озвучення)
+        self.muted = False
         self._stop = False
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -102,6 +102,7 @@ class Capture:
             if _PA is None:
                 _PA = pyaudio.PyAudio()
         pa = _PA
+
         while not self._stop:
             if not self.enabled:
                 time.sleep(0.1)
@@ -110,8 +111,14 @@ class Capture:
                 dev = self._device(pa)
                 ch = max(1, int(dev["maxInputChannels"]))
                 sr = int(dev["defaultSampleRate"])
-                st = pa.open(format=pyaudio.paFloat32, channels=ch, rate=sr, input=True,
-                             input_device_index=dev["index"], frames_per_buffer=sr // 20)
+                st = pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=ch,
+                    rate=sr,
+                    input=True,
+                    input_device_index=dev["index"],
+                    frames_per_buffer=sr // 20,
+                )
                 while self.enabled and not self._stop:
                     raw = st.read(sr // 20, exception_on_overflow=False)
                     x = np.frombuffer(raw, np.float32).reshape(-1, ch).mean(axis=1)
@@ -121,5 +128,5 @@ class Capture:
                 st.stop_stream()
                 st.close()
             except Exception as e:
-                print(f"[аудіо {self.source}] {e}")
+                print(f"[аудіо Windows {self.source}] {e}")
                 time.sleep(1)

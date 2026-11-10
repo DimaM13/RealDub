@@ -26,10 +26,12 @@ DEFAULTS = {
     "max_lines": 3,
     # Через скільки секунд старий рядок зникає
     "line_ttl_sec": 15,
+    # Автоматично перевіряти оновлення на GitHub при старті
+    "check_updates_on_start": True,
 }
 
 # Версія налаштувань: при зміні старий config.json оновлюється новими типовими значеннями
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # Голоси Piper (офлайн синтез мовлення)
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"

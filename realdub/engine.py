@@ -1,19 +1,31 @@
-"""Розпізнавання (faster-whisper), переклад (CTranslate2 + SentencePiece), озвучення (Piper)."""
+"""ШІ-рушій: Faster-Whisper, NLLB-200, Piper TTS.
+Кросплатформна оптимізація для Windows (NVIDIA CUDA / CPU), macOS (Apple Silicon / Intel) та Linux."""
+import io
+import os
 import re
+import sys
 import threading
 import wave
-import io
+from pathlib import Path
 
 import numpy as np
 
 from realdub import config
 
-# Бібліотеки CUDA, встановлені через pip (nvidia-cublas / nvidia-cudnn)
-import os, site, glob
-for _sp in site.getsitepackages():
-    for _d in glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
-        os.add_dll_directory(_d)
-        os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
+# Безпечне підключення бібліотек CUDA на Windows
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    try:
+        import glob
+        import site
+        for _sp in site.getsitepackages():
+            for _d in glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
+                try:
+                    os.add_dll_directory(_d)
+                    os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 JUNK = {"", "you", "thank you.", "thanks for watching!", "дякую.", "дякую за перегляд!",
         "субтитри зроблені спільнотою amara.org", "thank you", "дякую", "bye.", "bye", "бувайте."}
@@ -38,12 +50,10 @@ def remove_repetitions(text: str) -> str:
     words = text.split()
     if len(words) < 6:
         return text
-    # Перевіряємо повторення n-грам від 2 до 10 слів
     for n in range(2, min(12, len(words) // 2 + 1)):
         for i in range(len(words) - 2 * n + 1):
             pattern = words[i:i + n]
             if words[i + n:i + 2 * n] == pattern:
-                # Знайдено точний цикл — повертаємо лише очищену частину без зациклення
                 return " ".join(words[:i + n])
     return text
 
@@ -53,21 +63,17 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     text = remove_repetitions(text)
-    # Прибираємо пробіли перед знаками пунктуації
     text = re.sub(r"\s+([,.:;!?…])", r"\1", text)
-    # З'єднуємо розірвані апострофи в українських словах
     text = re.sub(r"(\w)\s*[''`’]\s*(\w)", r"\1'\2", text)
-    # Прибираємо зайві пробіли всередині лапок та дужок
     text = re.sub(r'([«"“(\[])\s+', r"\1", text)
     text = re.sub(r'\s+([»"”)\]])', r"\1", text)
-    # Нормалізуємо пробіли
     text = re.sub(r"\s+", " ", text).strip()
     if text and text[0].islower():
         text = text[0].upper() + text[1:]
     return text
 
 
-def _cuda() -> bool:
+def _has_cuda() -> bool:
     try:
         import ctranslate2
         return ctranslate2.get_cuda_device_count() > 0
@@ -76,17 +82,24 @@ def _cuda() -> bool:
 
 
 class Recognizer:
+    """Розпізнавання мовлення через faster-whisper (NVIDIA GPU або процесор)."""
+
     def __init__(self, cfg):
         from faster_whisper import WhisperModel
         path = config.MODELS / f"whisper-{cfg['whisper_model']}"
-        gpu = cfg["device"] == "cuda" or (cfg["device"] == "auto" and _cuda())
-        try:
-            self.model = WhisperModel(str(path), device="cuda" if gpu else "cpu",
-                                      compute_type="int8_float16" if gpu else "int8")
-        except Exception:
+        want_cuda = cfg["device"] == "cuda" or (cfg["device"] == "auto" and _has_cuda())
+        
+        if want_cuda:
+            try:
+                self.model = WhisperModel(str(path), device="cuda", compute_type="int8_float16")
+                self.device = "NVIDIA GPU"
+            except Exception:
+                self.model = WhisperModel(str(path), device="cpu", compute_type="int8")
+                self.device = "процесор"
+        else:
             self.model = WhisperModel(str(path), device="cpu", compute_type="int8")
-            gpu = False
-        self.device = "відеокарта" if gpu else "процесор"
+            self.device = "процесор"
+
         self.lock = threading.Lock()
 
     def __call__(self, audio: np.ndarray, lang: str) -> str:
@@ -97,7 +110,7 @@ class Recognizer:
                 language=lang,
                 beam_size=1,
                 temperature=0.0,
-                initial_prompt=None,  # вимкнено для запобігання галюцинаціям
+                initial_prompt=None,
                 condition_on_previous_text=False,
                 without_timestamps=True,
                 vad_filter=True,
@@ -114,15 +127,21 @@ NLLB_CODES = {"en": "eng_Latn", "uk": "ukr_Cyrl"}
 
 
 class NLLB:
-    """Одна модель NLLB-200 для обох напрямів (якісніший переклад)."""
+    """Одна модель NLLB-200 для обох напрямків (CUDA або CPU)."""
 
-    def __init__(self, gpu: bool):
+    def __init__(self, use_gpu: bool = False):
         import ctranslate2
         import sentencepiece as spm
         root = config.MODELS / "nllb-600m"
         self.sp = spm.SentencePieceProcessor(model_proto=(root / "sentencepiece.bpe.model").read_bytes())
-        self.tr = ctranslate2.Translator(str(root), device="cuda" if gpu else "cpu",
-                                         compute_type="int8_float16" if gpu else "int8")
+        
+        dev = "cuda" if use_gpu else "cpu"
+        comp = "int8_float16" if use_gpu else "int8"
+        try:
+            self.tr = ctranslate2.Translator(str(root), device=dev, compute_type=comp)
+        except Exception:
+            self.tr = ctranslate2.Translator(str(root), device="cpu", compute_type="int8")
+            
         self.lock = threading.Lock()
 
     def make(self, src: str, dst: str):
@@ -137,7 +156,6 @@ class NLLB:
             if not sents:
                 return ""
 
-            # Якщо речення не має розділового знаку, додаємо його для кращої синтаксичної побудови
             prepared = []
             for s_item in sents:
                 clean_s = s_item.strip()
@@ -163,17 +181,19 @@ class NLLB:
 
 
 class Translator:
-    def __init__(self, src: str, dst: str, gpu: bool):
+    """Запасний легкий перекладач Opus-MT / Argos."""
+
+    def __init__(self, src: str, dst: str, use_gpu: bool = False):
         import ctranslate2
         root = config.MODELS / f"mt-{src}-{dst}"
         model_dir = next(root.rglob("model.bin")).parent
         sp = next(root.rglob("sentencepiece.model"), None)
-        if sp:  # токенізатор SentencePiece
+        if sp:
             import sentencepiece as spm
             proc = spm.SentencePieceProcessor(model_proto=sp.read_bytes())
             self.enc = lambda s: proc.encode(s, out_type=str)
             self.dec = lambda t: proc.decode(t).replace("▁", " ")
-        else:  # Moses + BPE (subword-nmt)
+        else:
             from sacremoses import MosesDetokenizer, MosesTokenizer
             from subword_nmt.apply_bpe import BPE
             mt, md = MosesTokenizer(lang=src), MosesDetokenizer(lang=dst)
@@ -182,29 +202,36 @@ class Translator:
             self.enc = lambda s: bpe.process_line(
                 mt.tokenize(s, aggressive_dash_splits=True, return_str=True)).split()
             self.dec = lambda t: md.detokenize(" ".join(t).replace("@@ ", "").split())
-        self.tr = ctranslate2.Translator(str(model_dir), device="cuda" if gpu else "cpu",
-                                         compute_type="int8_float16" if gpu else "int8")
+            
+        dev = "cuda" if use_gpu else "cpu"
+        comp = "int8_float16" if use_gpu else "int8"
+        try:
+            self.tr = ctranslate2.Translator(str(model_dir), device=dev, compute_type=comp)
+        except Exception:
+            self.tr = ctranslate2.Translator(str(model_dir), device="cpu", compute_type="int8")
         self.lock = threading.Lock()
 
-    def __call__(self, text: str) -> str:
+    def __call__(self, text: str, fast: bool = False) -> str:
         sents = [s for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s]
         if not sents:
             return ""
         toks = [self.enc(s) for s in sents]
         with self.lock:
-            res = self.tr.translate_batch(toks, beam_size=1, max_decoding_length=200)
-        return " ".join(self.dec(r.hypotheses[0]) for r in res).strip()
+            res = self.tr.translate_batch(toks, beam_size=1 if fast else 2, max_decoding_length=180)
+        return clean_text(" ".join(self.dec(r.hypotheses[0]) for r in res))
 
 
 def _espeak_kwargs() -> dict:
-    """espeak-ng не відкриває шляхи з не-латинськими символами — копіюємо дані в латинський шлях."""
+    """Налаштування espeak-ng для захисту від не-ASCII шляхів на Windows."""
     try:
-        import shutil
-        from pathlib import Path
         from piper.phonemize_espeak import ESPEAK_DATA_DIR
         src = Path(ESPEAK_DATA_DIR)
-        if str(src).isascii():
+        if sys.platform != "win32" or str(src).isascii():
+            if src.exists():
+                return {"espeak_data_dir": str(src)}
             return {}
+
+        import shutil
         base = Path(os.environ.get("LOCALAPPDATA", "C:/ProgramData"))
         if not str(base).isascii():
             base = Path("C:/ProgramData")
@@ -212,12 +239,12 @@ def _espeak_kwargs() -> dict:
         if not (dst / "phontab").exists():
             shutil.copytree(src, dst, dirs_exist_ok=True)
         return {"espeak_data_dir": str(dst)}
-    except ImportError:
+    except Exception:
         return {}
 
 
 class Speaker:
-    """Офлайн озвучення голосами Piper у вибраний пристрій виводу."""
+    """Офлайн синтез мовлення через Piper."""
 
     def __init__(self, cfg):
         self.cfg, self.voices, self.lock = cfg, {}, threading.Lock()
@@ -226,15 +253,17 @@ class Speaker:
         if lang not in self.voices:
             from piper import PiperVoice
             name = config.VOICES[lang].rsplit("/", 1)[-1]
-            self.voices[lang] = PiperVoice.load(str(config.MODELS / "voices" / f"{name}.onnx"),
-                                                **_espeak_kwargs())
+            self.voices[lang] = PiperVoice.load(
+                str(config.MODELS / "voices" / f"{name}.onnx"),
+                **_espeak_kwargs()
+            )
         return self.voices[lang]
 
     def _synth(self, v, text):
-        try:  # piper-tts >= 1.3
+        try:
             chunks = list(v.synthesize(text))
             return np.concatenate([c.audio_int16_array for c in chunks]), chunks[0].sample_rate
-        except (TypeError, AttributeError):  # старіші версії
+        except Exception:
             buf = io.BytesIO()
             with wave.open(buf, "wb") as w:
                 v.synthesize(text, w)
