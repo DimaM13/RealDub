@@ -191,9 +191,9 @@ class Overlay(QWidget):
         self.b_sys = self._btn("🎧 Звук ПК EN→UK", True)
         self.b_sys.setToolTip("Перекладати звук із комп'ютера (відео, Zoom, Meet, ігри) з англійської на українську")
 
-        self.b_mic = self._btn("🎤 Мікрофон UK→EN", True)
+        self.b_mic = self._btn("🎤 Мікрофон EN→UK", True)
         self.b_mic.setObjectName("mic")
-        self.b_mic.setToolTip("Перекладати ваш голос із мікрофона з української на англійську")
+        self.b_mic.setToolTip("Перекладати звук із мікрофона з англійської на українську")
 
         self.b_tts = self._btn("🔊 Озвучка", True)
         self.b_tts.setToolTip("Озвучувати перекладений англійський текст голосом")
@@ -472,19 +472,35 @@ class Overlay(QWidget):
             op = "0.80" if live else "1.0"
             live_badge = "<span style='color:#fbbf24; font-size:12px; font-weight:600;'> ⚡ мовлення…</span>" if live else ""
             if d == "in":
-                tag = "<span style='color:#38bdf8; font-weight:700;'>EN → UK</span>"
+                tag = "<span style='color:#38bdf8; font-weight:700;'>🎧 EN → UK</span>"
                 return (
                     f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
                     f"<span style='font-size:{orig_fs}pt; color:#cbd5e1; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
                     f"<span style='color:#ffffff; font-size:{fs}pt; font-weight:600;'>{_esc(t)}</span>"
                     f"</div>"
                 )
+            elif d == "mic":
+                tag = "<span style='color:#34d399; font-weight:700;'>🎤 EN → UK</span>"
+                return (
+                    f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
+                    f"<span style='font-size:{orig_fs}pt; color:#cbd5e1; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
+                    f"<span style='color:#ffffff; font-size:{fs}pt; font-weight:600;'>{_esc(t)}</span>"
+                    f"</div>"
+                )
+            elif d == "text_in":
+                tag = "<span style='color:#38bdf8; font-weight:700;'>✍️ EN → UK</span>"
+                return (
+                    f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
+                    f"<span style='font-size:{orig_fs}pt; color:#cbd5e1; font-weight:500;'>{tag} · {_esc(o)}</span><br>"
+                    f"<span style='color:#ffffff; font-size:{fs}pt; font-weight:600;'>{_esc(t)}</span>"
+                    f"</div>"
+                )
             else:
-                tag = "<span style='color:#34d399; font-weight:700;'>UK → EN</span>"
+                tag = "<span style='color:#a78bfa; font-weight:700;'>✍️ UK → EN</span>"
                 en_fs = fs + 1
                 return (
                     f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
-                    f"<span style='font-size:{max(15, orig_fs - 1)}pt; color:#94a3b8; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
+                    f"<span style='font-size:{max(15, orig_fs - 1)}pt; color:#94a3b8; font-weight:500;'>{tag} · {_esc(o)}</span><br>"
                     f"<span style='color:#68ffa8; font-size:{en_fs}pt; font-weight:600;'>{_esc(t)}</span>"
                     f"</div>"
                 )
@@ -562,7 +578,7 @@ class Pipeline:
 
     def __init__(self, cfg, bus, ui: Overlay):
         self.cfg, self.bus, self.ui = cfg, bus, ui
-        self.lanes = {"in": Lane(), "out": Lane()}
+        self.lanes = {"in": Lane(), "mic": Lane()}
         self.typed = queue.Queue()
         self._stopped = False
         self._switching_model = False
@@ -570,7 +586,7 @@ class Pipeline:
         mk = lambda d: Segmenter(lambda a, f: self.lanes[d].put(a, f), cfg["min_level"],
                                  cfg["silence_sec"], cfg["max_phrase_sec"], cfg["live_partial"])
         self.cap_sys = Capture("system", mk("in"), cfg)
-        self.cap_mic = Capture("mic", mk("out"), cfg)
+        self.cap_mic = Capture("mic", mk("mic"), cfg)
         ui.b_sys.toggled.connect(lambda v: setattr(self.cap_sys, "enabled", v))
         ui.b_mic.toggled.connect(lambda v: setattr(self.cap_mic, "enabled", v))
         ui.on_typed = self.typed.put
@@ -589,32 +605,16 @@ class Pipeline:
 
     def _load(self):
         try:
-            from realdub.engine import NLLB, Recognizer, Speaker, Translator, WordAndTextTranslator
+            from realdub.engine import NLLB, Recognizer, Speaker, TextTranslator
             self.asr = Recognizer(self.cfg, on_status=self.bus.status.emit)
             gpu = "GPU" in self.asr.device
-            nllb = None
-            opus_uk_en = None
-            opus_en_uk = None
             try:
                 nllb = NLLB(gpu)
-                self.en_uk, self.uk_en = nllb.make("en", "uk"), nllb.make("uk", "en")
-            except Exception:
-                pass
-            try:
-                opus_en_uk = Translator("en", "uk", gpu)
-                opus_uk_en = Translator("uk", "en", gpu)
-                if not hasattr(self, "en_uk"):
-                    self.en_uk, self.uk_en = opus_en_uk, opus_uk_en
+                self.en_uk = nllb.make("en", "uk")
             except Exception:
                 pass
 
-            self.word_tr = WordAndTextTranslator(
-                nllb=nllb,
-                opus_uk_en=opus_uk_en,
-                opus_en_uk=opus_en_uk,
-                fallback_uk_en=self.uk_en,
-                fallback_en_uk=self.en_uk,
-            )
+            self.word_tr = TextTranslator(use_gpu=gpu)
             self.tts = Speaker(self.cfg)
             self.asr(np.zeros(16000, np.float32), "en", fast=True)  # прогрів
         except StopIteration:
@@ -627,7 +627,7 @@ class Pipeline:
         self.bus.ready.emit()
         if self.cfg.get("check_updates_on_start", True):
             threading.Thread(target=self._check_update_bg, daemon=True).start()
-        for d in ("in", "out"):
+        for d in ("in", "mic"):
             threading.Thread(target=self._loop, args=(d,), daemon=True).start()
         threading.Thread(target=self._typed_loop, daemon=True).start()
 
@@ -678,7 +678,7 @@ class Pipeline:
 
     def _loop(self, d):
         lane = self.lanes[d]
-        mt = self.en_uk if d == "in" else self.uk_en
+        mt = self.en_uk
         last_partial_orig = ""
         while not self._stopped:
             audio, final = lane.get()
@@ -695,7 +695,7 @@ class Pipeline:
                     continue
                 t0 = time.time()
                 cur_asr = self.asr
-                orig = cur_asr(audio, "en" if d == "in" else "uk", fast=not final)
+                orig = cur_asr(audio, "en", fast=not final)
                 if not final and lane.finals:
                     continue
                 if not orig:
@@ -714,14 +714,6 @@ class Pipeline:
                         tr = mt(orig)
                 else:
                     last_partial_orig = ""
-                    if d == "out" and len(orig.split()) <= 2 and hasattr(self, "word_tr"):
-                        _, tr, speak_txt = self.word_tr.translate(orig)
-                        self.bus.line.emit(d, orig, tr, True)
-                        if self.ui.b_tts.isChecked() and speak_txt:
-                            threading.Thread(target=self._speak, args=(speak_txt,), daemon=True).start()
-                        if not self._switching_model:
-                            self.bus.status.emit(f"✅ Whisper {self.asr.display_name} · {time.time() - t0:.1f} с")
-                        continue
                     try:
                         tr = mt(orig, fast=False)
                     except TypeError:
@@ -741,12 +733,14 @@ class Pipeline:
 
     def _speak(self, text):
         self.cap_sys.muted = True
+        self.cap_mic.muted = True
         try:
             self.tts.say(text, "en")
         except Exception as e:
             self.bus.status.emit(f"⚠ Озвучення: {e}")
         finally:
             self.cap_sys.muted = False
+            self.cap_mic.muted = False
 
     def shutdown(self):
         """Повністю зупиняє потоки, закриває аудіо та звільняє моделі з GPU/ОЗП."""

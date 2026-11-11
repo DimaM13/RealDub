@@ -1,12 +1,7 @@
 """Перевірка та одноразове завантаження моделей ШІ.
-Якщо моделі вже є у папці models/ (як в установнику), інтернет взагалі не потрібен."""
-import io
+Якщо моделі вже є у папці models/ (як в установленому пакеті), інтернет взагалі не потрібен."""
 import sys
-import zipfile
-
 from realdub import config
-
-ARGOS_INDEX = "https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json"
 
 
 def fetch(url: str) -> bytes:
@@ -28,25 +23,16 @@ def get_whisper(name: str):
     download_model(name, output_dir=str(out))
 
 
-def get_translator(src: str, dst: str, index: list):
-    out = config.MODELS / f"mt-{src}-{dst}"
-    if out.exists() and any(out.rglob("model.bin")):
-        print(f"✓ Словниковий переклад {src}→{dst} вже є")
+def get_text_translator(src: str, dst: str):
+    out = config.MODELS / f"text-{src}-{dst}"
+    if (out / "model.bin").exists():
+        print(f"✓ Модель перекладу тексту {src}↔{dst} вже є")
         return
-    pkg = next((p for p in index if p.get("from_code") == src and p.get("to_code") == dst), None)
-    if not pkg:
-        sys.exit(f"✗ Не знайдено модель перекладу {src}→{dst}")
-    print(f"• Завантажую переклад {src}→{dst}…")
-    for link in pkg["links"]:
-        try:
-            data = fetch(link)
-            break
-        except Exception as e:
-            print(f"  помилка: {e}")
-    else:
-        sys.exit("✗ Не вдалося завантажити")
+    repo = f"mults/hplt-translate-{src}-{dst}-ct2-int8"
+    print(f"• Завантажую модель перекладу тексту {src}→{dst} ({repo})…")
+    from huggingface_hub import snapshot_download
     out.mkdir(parents=True, exist_ok=True)
-    zipfile.ZipFile(io.BytesIO(data)).extractall(out)
+    snapshot_download(repo, local_dir=str(out))
 
 
 def get_voice(lang: str):
@@ -77,13 +63,8 @@ if __name__ == "__main__":
     get_whisper("medium")
     get_whisper("small")
     get_nllb()
-    if not (config.MODELS / "mt-en-uk").exists() or not (config.MODELS / "mt-uk-en").exists():
-        import requests
-        index = requests.get(ARGOS_INDEX, timeout=60).json()
-        get_translator("en", "uk", index)
-        get_translator("uk", "en", index)
-    else:
-        print("✓ Словникові моделі en↔uk вже є")
+    get_text_translator("en", "uk")
+    get_text_translator("uk", "en")
     get_voice("uk")
     get_voice("en")
     print("\nГотово! Усі моделі на місці для 100% автономної офлайн-роботи.")

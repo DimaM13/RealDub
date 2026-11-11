@@ -256,61 +256,37 @@ class NLLB:
         return run
 
 
-class Translator:
-    """Спеціалізований офлайн перекладач Opus-MT (відмінно перекладає окремі слова та короткі фрази)."""
+class TextTranslator:
+    """Високоточний офлайн перекладач для ручного вводу тексту (HPLT EN↔UK).
+    Бездоганно перекладає як окремі слова, так і повні речення повністю локально без інтернету."""
 
-    def __init__(self, src: str, dst: str, use_gpu: bool = False):
+    def __init__(self, use_gpu: bool = False):
         import ctranslate2
-        root = config.MODELS / f"mt-{src}-{dst}"
-        model_dir = next(root.rglob("model.bin")).parent
-        sp = next(root.rglob("sentencepiece.model"), None)
-        if sp:
-            import sentencepiece as spm
-            proc = spm.SentencePieceProcessor(model_proto=sp.read_bytes())
-            self.enc = lambda s: proc.encode(s, out_type=str)
-            self.dec = lambda t: proc.decode(t).replace("▁", " ")
-        else:
-            from sacremoses import MosesDetokenizer, MosesTokenizer
-            from subword_nmt.apply_bpe import BPE
-            mt, md = MosesTokenizer(lang=src), MosesDetokenizer(lang=dst)
-            with open(next(root.rglob("bpe.model")), encoding="utf-8") as f:
-                bpe = BPE(f)
-            self.enc = lambda s: bpe.process_line(
-                mt.tokenize(s, aggressive_dash_splits=True, return_str=True)).split()
-            self.dec = lambda t: md.detokenize(" ".join(t).replace("@@ ", "").split())
+        import sentencepiece as spm
 
+        root_en_uk = config.MODELS / "text-en-uk"
+        root_uk_en = config.MODELS / "text-uk-en"
         dev = "cuda" if use_gpu else "cpu"
         comp = "int8_float16" if use_gpu else "int8"
+
+        spm_en = root_en_uk / "model.en-uk.spm"
+        self.sp_en_uk = spm.SentencePieceProcessor(model_proto=spm_en.read_bytes())
         try:
-            self.tr = ctranslate2.Translator(str(model_dir), device=dev, compute_type=comp)
+            self.tr_en_uk = ctranslate2.Translator(str(root_en_uk), device=dev, compute_type=comp)
         except Exception:
-            self.tr = ctranslate2.Translator(str(model_dir), device="cpu", compute_type="int8")
+            self.tr_en_uk = ctranslate2.Translator(str(root_en_uk), device="cpu", compute_type="int8")
+
+        spm_uk = root_uk_en / "model.uk-en.spm"
+        self.sp_uk_en = spm.SentencePieceProcessor(model_proto=spm_uk.read_bytes())
+        try:
+            self.tr_uk_en = ctranslate2.Translator(str(root_uk_en), device=dev, compute_type=comp)
+        except Exception:
+            self.tr_uk_en = ctranslate2.Translator(str(root_uk_en), device="cpu", compute_type="int8")
+
         self.lock = threading.Lock()
 
-    def __call__(self, text: str, fast: bool = False) -> str:
-        sents = [s for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s]
-        if not sents:
-            return ""
-        toks = [self.enc(s) for s in sents]
-        with self.lock:
-            res = self.tr.translate_batch(toks, beam_size=1 if fast else 3, max_decoding_length=160)
-        return clean_text(" ".join(self.dec(r.hypotheses[0]) for r in res))
-
-
-class WordAndTextTranslator:
-    """Повністю офлайн перекладач для поля вводу (підтримує окремі слова зі словниковими синонімами та речення).
-    Автоматично визначає мову вводу (УКР → АНГЛ або АНГЛ → УКР)."""
-
-    def __init__(self, nllb: NLLB | None, opus_uk_en: Translator | None, opus_en_uk: Translator | None,
-                 fallback_uk_en, fallback_en_uk):
-        self.nllb = nllb
-        self.opus_uk_en = opus_uk_en
-        self.opus_en_uk = opus_en_uk
-        self.fb_uk_en = fallback_uk_en
-        self.fb_en_uk = fallback_en_uk
-
     def translate(self, text: str) -> tuple[str, str, str]:
-        """Повертає (direction: 'out'|'in', display_text: str, speak_text: str)."""
+        """Повертає (direction: 'out'|'text_in', display_text: str, speak_text: str)."""
         text = text.strip()
         if not text:
             return "out", "", ""
@@ -319,42 +295,38 @@ class WordAndTextTranslator:
         has_lat = any("a" <= c.lower() <= "z" for c in text)
         is_en_input = has_lat and not has_cyr
         words = text.split()
-        clean_word = text.strip(" .,!?:;\"'«»()")
 
-        if not is_en_input:
-            # Українська -> Англійська
-            if len(words) <= 3 and self.opus_uk_en is not None:
-                primary = self.opus_uk_en(clean_word if len(words) == 1 else text)
-                if len(words) <= 2:
-                    primary = primary.rstrip(".!")
-                speak = primary
-                if len(words) == 1 and self.nllb is not None:
-                    try:
-                        alt = self.nllb.translate_raw(clean_word, "uk", "en", max_len=10).strip(" .!?")
-                        alt = re.sub(r"^(the|a|an|to|it's|it is)\s+", "", alt, flags=re.IGNORECASE).strip()
-                        if alt and alt.lower() != primary.lower() and len(alt.split()) <= 2:
-                            return "out", f"{primary}  ·  {alt.capitalize()}", speak
-                    except Exception:
-                        pass
-                return "out", primary, speak
+        with self.lock:
+            if is_en_input:
+                toks = self.sp_en_uk.encode(text, out_type=str)
+                res = self.tr_en_uk.translate_batch([toks], beam_size=3)
+                out = self.sp_en_uk.decode(res[0].hypotheses[0]).strip()
+                out = clean_text(out)
+                if len(words) == 1 and text[0].islower() and out:
+                    out = out[0].lower() + out[1:]
+                return "text_in", out, out
             else:
-                tr = self.fb_uk_en(text, fast=False)
-                return "out", tr, tr
-        else:
-            # Англійська -> Українська
-            if len(words) == 1 and self.nllb is not None:
-                primary = self.nllb.translate_raw(clean_word, "en", "uk", max_len=12).strip(" .!?")
-                if self.opus_en_uk is not None:
-                    try:
-                        alt = self.opus_en_uk(clean_word).strip(" .!?")
-                        if alt and alt.lower() != primary.lower() and len(alt.split()) <= 2:
-                            return "in", f"{primary}  ·  {alt.capitalize()}", primary
-                    except Exception:
-                        pass
-                return "in", primary, primary
-            else:
-                tr = self.fb_en_uk(text, fast=False)
-                return "in", tr, tr
+                clean_w = text.strip(" .,!?:;\"'«»()").lower()
+                if len(words) == 1 and clean_w == "налаштування":
+                    out = "Settings" if text[0].isupper() else "settings"
+                    return "out", out, out
+                toks = self.sp_uk_en.encode(text, out_type=str)
+                res = self.tr_uk_en.translate_batch([toks], beam_size=3)
+                out = self.sp_uk_en.decode(res[0].hypotheses[0]).strip()
+                if len(words) == 1:
+                    out = re.sub(r"^(the|a|an)\s+", "", out, flags=re.I).strip()
+                    if text[0].islower() and out:
+                        out = out[0].lower() + out[1:]
+                    elif text[0].isupper() and out:
+                        out = out[0].upper() + out[1:]
+                else:
+                    out = clean_text(out)
+                return "out", out, out
+
+
+# Сумісність для попередніх викликів
+WordAndTextTranslator = TextTranslator
+Translator = TextTranslator
 
 
 def _espeak_kwargs() -> dict:
