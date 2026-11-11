@@ -1,4 +1,4 @@
-"""ШІ-рушій: Faster-Whisper, NLLB-200, Piper TTS.
+"""ШІ-рушій: Faster-Whisper (Small / Medium / Large-v3-Turbo), NLLB-200, Opus-MT (для слів), Piper TTS.
 Оптимізовано для Windows (NVIDIA CUDA або процесор)."""
 import io
 import os
@@ -40,6 +40,18 @@ QUESTION_STARTERS = {
     "uk": ("чи", "як", "де", "коли", "чому", "хто", "що", "який", "яка", "яке", "які", "куди", "звідки", "навіщо"),
 }
 
+_RUS_FIXES = {
+    r"\bнастройки\b": "налаштування",
+    r"\bнастройка\b": "налаштування",
+    r"\bсообщение\b": "повідомлення",
+    r"\bсообщения\b": "повідомлення",
+    r"\bприложение\b": "застосунок",
+    r"\bсейчас\b": "зараз",
+    r"\bспасибо\b": "дякую",
+    r"\bпожалуйста\b": "будь ласка",
+    r"\bвообще\b": "взагалі",
+}
+
 
 def prepare_audio(audio: np.ndarray) -> np.ndarray:
     """Видаляє постійне зміщення без штучного посилення фонового шуму."""
@@ -68,6 +80,8 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     text = remove_repetitions(text)
+    for pat, repl in _RUS_FIXES.items():
+        text = re.sub(pat, repl, text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,.:;!?…])", r"\1", text)
     text = re.sub(r"(\w)\s*[''`’]\s*(\w)", r"\1'\2", text)
     text = re.sub(r'([«"“(\[])\s+', r"\1", text)
@@ -86,14 +100,43 @@ def _has_cuda() -> bool:
         return False
 
 
+def ensure_whisper_model(model_name: str, on_status=None) -> Path:
+    """Перевіряє наявність моделі Whisper; за потреби завантажує її або бере наявну."""
+    out = config.MODELS / f"whisper-{model_name}"
+    if (out / "model.bin").exists():
+        return out
+
+    repo = config.WHISPER_MODELS.get(model_name, (model_name, None))[1]
+    if repo:
+        try:
+            if on_status:
+                on_status(f"📥 Завантажую модель Whisper ({model_name})… Зачекайте")
+            from huggingface_hub import snapshot_download
+            out.mkdir(parents=True, exist_ok=True)
+            snapshot_download(repo, local_dir=str(out))
+            if (out / "model.bin").exists():
+                return out
+        except Exception:
+            pass
+
+    # Якщо немає інтернету — шукаємо будь-яку вже встановлену модель Whisper
+    for fallback in ("large-v3-turbo", "medium", "small", "base", "tiny"):
+        fb_dir = config.MODELS / f"whisper-{fallback}"
+        if (fb_dir / "model.bin").exists():
+            return fb_dir
+    return out
+
+
 class Recognizer:
     """Розпізнавання мовлення через faster-whisper (NVIDIA GPU або процесор)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, on_status=None):
         from faster_whisper import WhisperModel
-        path = config.MODELS / f"whisper-{cfg['whisper_model']}"
+        self.model_name = cfg.get("whisper_model", "large-v3-turbo")
+        path = ensure_whisper_model(self.model_name, on_status=on_status)
+        self.model_name = path.name.replace("whisper-", "")
         want_cuda = cfg["device"] == "cuda" or (cfg["device"] == "auto" and _has_cuda())
-        
+
         if want_cuda:
             try:
                 self.model = WhisperModel(str(path), device="cuda", compute_type="int8_float16")
@@ -107,19 +150,20 @@ class Recognizer:
 
         self.lock = threading.Lock()
 
-    def __call__(self, audio: np.ndarray, lang: str) -> str:
+    def __call__(self, audio: np.ndarray, lang: str, fast: bool = False) -> str:
         audio = prepare_audio(audio)
+        beam = 1 if fast else 3
         with self.lock:
             segs, _ = self.model.transcribe(
                 audio,
                 language=lang,
-                beam_size=1,
+                beam_size=beam,
                 temperature=0.0,
                 initial_prompt=None,
                 condition_on_previous_text=False,
                 without_timestamps=True,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=250, speech_pad_ms=80),
+                vad_parameters=dict(min_silence_duration_ms=240, speech_pad_ms=90),
                 compression_ratio_threshold=2.2,
                 no_speech_threshold=0.6,
             )
@@ -135,22 +179,37 @@ NLLB_CODES = {"en": "eng_Latn", "uk": "ukr_Cyrl"}
 
 
 class NLLB:
-    """Одна модель NLLB-200 для обох напрямків (CUDA або CPU)."""
+    """Модель NLLB-200 для живого перекладу речень (CUDA або CPU)."""
 
     def __init__(self, use_gpu: bool = False):
         import ctranslate2
         import sentencepiece as spm
         root = config.MODELS / "nllb-600m"
         self.sp = spm.SentencePieceProcessor(model_proto=(root / "sentencepiece.bpe.model").read_bytes())
-        
+
         dev = "cuda" if use_gpu else "cpu"
         comp = "int8_float16" if use_gpu else "int8"
         try:
             self.tr = ctranslate2.Translator(str(root), device=dev, compute_type=comp)
         except Exception:
             self.tr = ctranslate2.Translator(str(root), device="cpu", compute_type="int8")
-            
+
         self.lock = threading.Lock()
+
+    def translate_raw(self, text: str, src: str, dst: str, max_len: int = 24) -> str:
+        """Прямий переклад без додавання крапки (ідеально для окремих слів та коротких виразів)."""
+        s, t = NLLB_CODES[src], NLLB_CODES[dst]
+        toks = [[s] + self.sp.encode(text.strip(), out_type=str) + ["</s>"]]
+        with self.lock:
+            res = self.tr.translate_batch(
+                toks,
+                target_prefix=[[t]],
+                beam_size=2,
+                max_decoding_length=max_len,
+                repetition_penalty=1.15,
+            )
+        decoded = self.sp.decode([p for p in res[0].hypotheses[0] if p != t])
+        return clean_text(decoded)
 
     def make(self, src: str, dst: str):
         s, t = NLLB_CODES[src], NLLB_CODES[dst]
@@ -165,31 +224,40 @@ class NLLB:
                 return ""
 
             prepared = []
+            max_words = 1
             for s_item in sents:
                 clean_s = s_item.strip()
-                if clean_s and clean_s[-1] not in ".!?…":
-                    first_w = clean_s.split()[0].lower().strip(".,:;!?")
+                w_list = clean_s.split()
+                max_words = max(max_words, len(w_list))
+                # Додаємо крапку або знак питання лише для повноцінних речень (від 4 слів),
+                # щоб на 1-3 словах модель не додумувала зайві фрази
+                if len(w_list) >= 4 and clean_s[-1] not in ".!?…":
+                    first_w = w_list[0].lower().strip(".,:;!?")
                     clean_s += "?" if first_w in starters else "."
                 prepared.append(clean_s)
 
             toks = [[s] + self.sp.encode(x, out_type=str) + ["</s>"] for x in prepared]
             beam = 1 if fast else 2
+            max_dec = min(180, max(16, max_words * 6))
             with self.lock:
                 res = self.tr.translate_batch(
                     toks,
                     target_prefix=[[t]] * len(toks),
                     beam_size=beam,
-                    max_decoding_length=180,
+                    max_decoding_length=max_dec,
                     repetition_penalty=1.15,
                 )
             decoded = " ".join(self.sp.decode([p for p in r.hypotheses[0] if p != t]) for r in res)
-            return clean_text(decoded)
+            out = clean_text(decoded)
+            if max_words <= 2:
+                out = out.rstrip(".")
+            return out
 
         return run
 
 
 class Translator:
-    """Запасний легкий перекладач Opus-MT / Argos."""
+    """Спеціалізований швидкий перекладач Opus-MT (відмінно перекладає окремі слова та короткі фрази)."""
 
     def __init__(self, src: str, dst: str, use_gpu: bool = False):
         import ctranslate2
@@ -210,7 +278,7 @@ class Translator:
             self.enc = lambda s: bpe.process_line(
                 mt.tokenize(s, aggressive_dash_splits=True, return_str=True)).split()
             self.dec = lambda t: md.detokenize(" ".join(t).replace("@@ ", "").split())
-            
+
         dev = "cuda" if use_gpu else "cpu"
         comp = "int8_float16" if use_gpu else "int8"
         try:
@@ -225,8 +293,68 @@ class Translator:
             return ""
         toks = [self.enc(s) for s in sents]
         with self.lock:
-            res = self.tr.translate_batch(toks, beam_size=1 if fast else 2, max_decoding_length=180)
+            res = self.tr.translate_batch(toks, beam_size=1 if fast else 3, max_decoding_length=160)
         return clean_text(" ".join(self.dec(r.hypotheses[0]) for r in res))
+
+
+class WordAndTextTranslator:
+    """Розумний перекладач для поля вводу (підтримує окремі слова зі словниковими синонімами та речення).
+    Автоматично визначає мову вводу (УКР → АНГЛ або АНГЛ → УКР)."""
+
+    def __init__(self, nllb: NLLB | None, opus_uk_en: Translator | None, opus_en_uk: Translator | None,
+                 fallback_uk_en, fallback_en_uk):
+        self.nllb = nllb
+        self.opus_uk_en = opus_uk_en
+        self.opus_en_uk = opus_en_uk
+        self.fb_uk_en = fallback_uk_en
+        self.fb_en_uk = fallback_en_uk
+
+    def translate(self, text: str) -> tuple[str, str, str]:
+        """Повертає (direction: 'out'|'in', display_text: str, speak_text: str)."""
+        text = text.strip()
+        if not text:
+            return "out", "", ""
+
+        has_cyr = any("а" <= c.lower() <= "я" or c.lower() in "іїєґ" for c in text)
+        has_lat = any("a" <= c.lower() <= "z" for c in text)
+        is_en_input = has_lat and not has_cyr
+        words = text.split()
+        clean_word = text.strip(" .,!?:;\"'«»()")
+
+        if not is_en_input:
+            # Українська -> Англійська
+            if len(words) <= 3 and self.opus_uk_en is not None:
+                primary = self.opus_uk_en(clean_word if len(words) == 1 else text)
+                if len(words) <= 2:
+                    primary = primary.rstrip(".!")
+                speak = primary
+                if len(words) == 1 and self.nllb is not None:
+                    try:
+                        alt = self.nllb.translate_raw(clean_word, "uk", "en", max_len=10).strip(" .!?")
+                        alt = re.sub(r"^(the|a|an|to|it's|it is)\s+", "", alt, flags=re.IGNORECASE).strip()
+                        if alt and alt.lower() != primary.lower() and len(alt.split()) <= 2:
+                            return "out", f"{primary}  ·  {alt.capitalize()}", speak
+                    except Exception:
+                        pass
+                return "out", primary, speak
+            else:
+                tr = self.fb_uk_en(text, fast=False)
+                return "out", tr, tr
+        else:
+            # Англійська -> Українська (коли користувач ввів англійське слово або фразу)
+            if len(words) == 1 and self.nllb is not None:
+                primary = self.nllb.translate_raw(clean_word, "en", "uk", max_len=12).strip(" .!?")
+                if self.opus_en_uk is not None:
+                    try:
+                        alt = self.opus_en_uk(clean_word).strip(" .!?")
+                        if alt and alt.lower() != primary.lower() and len(alt.split()) <= 2:
+                            return "in", f"{primary}  ·  {alt.capitalize()}", primary
+                    except Exception:
+                        pass
+                return "in", primary, primary
+            else:
+                tr = self.fb_en_uk(text, fast=False)
+                return "in", tr, tr
 
 
 def _espeak_kwargs() -> dict:

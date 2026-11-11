@@ -19,19 +19,25 @@ def fetch(url: str) -> bytes:
 
 
 def get_whisper(name: str):
-    from faster_whisper import download_model
     out = config.MODELS / f"whisper-{name}"
     if (out / "model.bin").exists():
         print(f"✓ Whisper {name} вже є")
         return
     print(f"• Завантажую Whisper {name}…")
-    download_model(name, output_dir=str(out))
+    repo = config.WHISPER_MODELS.get(name, (name, None))[1]
+    if repo:
+        from huggingface_hub import snapshot_download
+        out.mkdir(parents=True, exist_ok=True)
+        snapshot_download(repo, local_dir=str(out))
+    else:
+        from faster_whisper import download_model
+        download_model(name, output_dir=str(out))
 
 
 def get_translator(src: str, dst: str, index: list):
     out = config.MODELS / f"mt-{src}-{dst}"
     if out.exists() and any(out.rglob("model.bin")):
-        print(f"✓ Переклад {src}→{dst} вже є")
+        print(f"✓ Словниковий переклад {src}→{dst} вже є")
         return
     pkg = next((p for p in index if p.get("from_code") == src and p.get("to_code") == dst), None)
     if not pkg:
@@ -75,10 +81,14 @@ if __name__ == "__main__":
     cfg = config.load()
     config.MODELS.mkdir(exist_ok=True)
     get_whisper(cfg["whisper_model"])
+    get_whisper("small")
     get_nllb()
-    index = requests.get(ARGOS_INDEX, timeout=60).json()  # запасні легкі моделі
-    get_translator("en", "uk", index)
-    get_translator("uk", "en", index)
+    if not (config.MODELS / "mt-en-uk").exists() or not (config.MODELS / "mt-uk-en").exists():
+        index = requests.get(ARGOS_INDEX, timeout=60).json()
+        get_translator("en", "uk", index)
+        get_translator("uk", "en", index)
+    else:
+        print("✓ Словникові моделі en↔uk вже є")
     get_voice("uk")
     get_voice("en")
-    print("\nГотово! Тепер можна запускати без інтернету: start.bat")
+    print("\nГотово! Тепер можна запускати без інтернету.")

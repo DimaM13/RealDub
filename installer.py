@@ -112,9 +112,10 @@ def get_desktop_dirs() -> list[Path]:
     return dirs
 
 
-def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, working_dir: str, description: str):
+def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, working_dir: str, description: str, icon_path: str = ""):
     """Створює Windows .lnk ярлик через PowerShell (-EncodedCommand для підтримки кирилиці)."""
     import base64
+    icon_stmt = f"$s.IconLocation = '{icon_path},0'; " if icon_path else ""
     ps_cmd = (
         f"$ws = New-Object -ComObject WScript.Shell; "
         f"$s = $ws.CreateShortcut('{shortcut_path}'); "
@@ -122,6 +123,7 @@ def create_windows_shortcut(target_exe: str, args: str, shortcut_path: str, work
         f"$s.Arguments = '{args}'; "
         f"$s.WorkingDirectory = '{working_dir}'; "
         f"$s.Description = '{description}'; "
+        f"{icon_stmt}"
         f"$s.Save()"
     )
     encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
@@ -155,7 +157,7 @@ class InstallWorker(threading.Thread):
             shutil.copytree(SOURCE_DIR / "realdub", dst_realdub)
 
             # Копіюємо основні файли
-            for fname in ["main.pyw", "download_models.py", "requirements.txt", "README.md", "start.bat"]:
+            for fname in ["RealDub.exe", "main.pyw", "download_models.py", "requirements.txt", "README.md", "start.bat"]:
                 src_f = SOURCE_DIR / fname
                 if src_f.exists():
                     shutil.copy2(src_f, self.target / fname)
@@ -165,8 +167,7 @@ class InstallWorker(threading.Thread):
             dst_models = self.target / "models"
             if src_models.exists() and any(src_models.iterdir()):
                 self.on_step("Копіюю моделі ШІ з установника…", 40)
-                if not dst_models.exists():
-                    shutil.copytree(src_models, dst_models)
+                shutil.copytree(src_models, dst_models, dirs_exist_ok=True)
 
             # Створення віртуального середовища Python
             venv_dir = self.target / ".venv"
@@ -220,25 +221,32 @@ class InstallWorker(threading.Thread):
 
             # Створення ярликів
             self.on_step("Створюю ярлики на комп'ютері…", 95)
+            icon_ico = str(self.target / "realdub" / "icon.ico")
+            exe_launcher = self.target / "RealDub.exe"
+            sc_target = str(exe_launcher) if exe_launcher.exists() else venv_pythonw
+            sc_args = "" if exe_launcher.exists() else "main.pyw"
+
             if self.desktop_sc:
                 for desktop in get_desktop_dirs():
                     create_windows_shortcut(
-                        target_exe=venv_pythonw,
-                        args="main.pyw",
+                        target_exe=sc_target,
+                        args=sc_args,
                         shortcut_path=str(desktop / "RealDub.lnk"),
                         working_dir=str(self.target),
-                        description="RealDub — офлайн перекладач мовлення в реальному часі"
+                        description="RealDub — офлайн перекладач мовлення в реальному часі",
+                        icon_path=icon_ico,
                     )
 
             if self.startmenu_sc:
                 programs = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
                 if programs.exists():
                     create_windows_shortcut(
-                        target_exe=venv_pythonw,
-                        args="main.pyw",
+                        target_exe=sc_target,
+                        args=sc_args,
                         shortcut_path=str(programs / "RealDub.lnk"),
                         working_dir=str(self.target),
-                        description="RealDub — офлайн перекладач мовлення в реальному часі"
+                        description="RealDub — офлайн перекладач мовлення в реальному часі",
+                        icon_path=icon_ico,
                     )
 
             self.on_step("Встановлення завершено!", 100)

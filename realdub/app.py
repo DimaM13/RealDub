@@ -1,4 +1,6 @@
-"""Головне вікно-оверлей RealDub."""
+"""Прозорий оверлей поверх усіх вікон та конвеєр живого перекладу.
+Оптимізовано для Windows: сучасний інтерфейс, вибір потужності Whisper, словниковий переклад слів та чисте вивантаження з ОЗП/VRAM."""
+import ctypes
 import gc
 import os
 import queue
@@ -8,32 +10,107 @@ import threading
 import time
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, Signal, QTimer
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QSizeGrip, QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QSizeGrip, QVBoxLayout,
+                               QWidget)
 
 from realdub import __version__, config
 from realdub.audio import Capture, Segmenter, reset_pyaudio_instance
 from realdub.updater import apply_update, check_for_updates
 
+STYLE = """
+QWidget {
+    color: #f1f5f9;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+}
+QPushButton {
+    background: rgba(255, 255, 255, 18);
+    border: 1px solid rgba(255, 255, 255, 32);
+    border-radius: 9px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background: rgba(255, 255, 255, 34);
+    border-color: rgba(255, 255, 255, 55);
+}
+QPushButton:checked {
+    background: rgba(37, 99, 235, 225);
+    border-color: #60a5fa;
+    color: #ffffff;
+}
+QPushButton#mic:checked {
+    background: rgba(5, 150, 105, 225);
+    border-color: #34d399;
+    color: #ffffff;
+}
+QPushButton#send {
+    background: rgba(37, 99, 235, 190);
+    border-color: #60a5fa;
+    padding: 7px 14px;
+    font-size: 13px;
+}
+QPushButton#send:hover {
+    background: rgba(29, 78, 216, 230);
+}
+QPushButton#close {
+    background: rgba(239, 68, 68, 45);
+    border-color: rgba(239, 68, 68, 90);
+    padding: 5px 10px;
+}
+QPushButton#close:hover {
+    background: rgba(239, 68, 68, 210);
+    color: #ffffff;
+}
+QComboBox {
+    background: rgba(30, 41, 59, 210);
+    border: 1px solid rgba(148, 163, 184, 70);
+    border-radius: 9px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #e2e8f0;
+}
+QComboBox:hover {
+    border-color: #60a5fa;
+    background: rgba(30, 41, 59, 240);
+}
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+QComboBox QAbstractItemView {
+    background-color: #0f172a;
+    color: #f1f5f9;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 4px;
+}
+QLineEdit {
+    background: rgba(15, 23, 42, 195);
+    border: 1px solid rgba(148, 163, 184, 65);
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-size: 15px;
+    color: #ffffff;
+}
+QLineEdit:focus {
+    border-color: #60a5fa;
+    background: rgba(15, 23, 42, 235);
+}
+"""
+
 PID_FILE = config.ROOT / "realdub.pid"
 _NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-STYLE = """
-#panel { background: rgba(14,16,24,%d); border-radius: 14px; border: 1px solid rgba(255,255,255,35); }
-QLabel { color: #f2f4f8; background: transparent; }
-QPushButton { color:#cfd6e4; background: rgba(255,255,255,18); border:none; border-radius:8px;
-              padding:5px 10px; font-size:13px; }
-QPushButton:hover { background: rgba(255,255,255,40); }
-QPushButton:checked { background:#3d7cff; color:white; font-weight:600; }
-QLineEdit { color:white; background: rgba(255,255,255,20); border:none; border-radius:8px;
-            padding:6px 10px; font-size:14px; }
-"""
-
 
 def _ensure_single_instance():
-    """Завершує попередню завислу копію RealDub, щоб у пам'яті ПК ніколи не накопичувалися дублікати."""
+    """Завершує попередню завислу копію RealDub, щоб не дублювати моделі у відеопам'яті та ОЗП."""
     my_pid = os.getpid()
     if PID_FILE.exists():
         try:
@@ -45,7 +122,7 @@ def _ensure_single_instance():
                     timeout=3,
                     creationflags=_NO_WIN,
                 )
-                time.sleep(0.2)
+                time.sleep(0.25)
         except Exception:
             pass
     try:
@@ -56,86 +133,136 @@ def _ensure_single_instance():
 
 def _remove_pid_file():
     try:
-        if PID_FILE.exists() and PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
-            PID_FILE.unlink(missing_ok=True)
+        if PID_FILE.exists():
+            PID_FILE.unlink()
     except Exception:
         pass
 
 
 class Bus(QObject):
-    line = Signal(str, str, str, bool)  # напрям, оригінал, переклад, фінальний
+    line = Signal(str, str, str, bool)  # напрям ("in"|"out"), оригінал, переклад, чи фінальна
     status = Signal(str)
-    update_info = Signal(dict)
-    ready = Signal()
-    restart_app = Signal()
+    update_info = Signal(dict)          # інформація про нову версію з GitHub
+    ready = Signal()                    # сигнал готовності моделей
+    restart_app = Signal()              # безпечний перезапуск із головного потоку
 
 
 class Overlay(QWidget):
     def __init__(self, cfg, bus: Bus):
         super().__init__()
         self.cfg, self.bus = cfg, bus
-        self.lines, self.partial = [], {}
+        self.lines = []      # [(напрям, оригінал, переклад, час)]
+        self.partial = {}    # напрям -> (оригінал, переклад)
+
         self.setWindowTitle(f"RealDub v{__version__}")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        if config.ICON_ICO.exists():
+            self.setWindowIcon(QIcon(str(config.ICON_ICO)))
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet(STYLE % int(cfg["opacity"] * 255))
-        self.resize(840, 310)
-        self.setMinimumSize(520, 180)
-        scr = QApplication.primaryScreen().availableGeometry()
-        self.move(scr.center().x() - 420, scr.bottom() - 350)
+        self.setStyleSheet(STYLE)
 
-        panel = QWidget(objectName="panel")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(panel)
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(14, 10, 14, 10)
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        w, h = min(980, int(scr.width() * 0.66)), 275
+        self.setGeometry(scr.center().x() - w // 2, scr.bottom() - h - 48, w, h)
+        self.setMinimumSize(640, 185)
 
-        bar = QHBoxLayout()
-        title = QLabel(f"🌐 RealDub v{__version__}")
-        title.setStyleSheet("font-weight:600; font-size:14px; color:#9fb4ff;")
-        bar.addWidget(title)
-        self.st = QLabel("Завантаження моделей…")
-        self.st.setStyleSheet("color:#8a93a6; font-size:12px;")
-        bar.addWidget(self.st, 1)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(8)
 
-        self.b_sys = self._btn("🎧 Звук ПК  EN→UK", True)
-        self.b_mic = self._btn("🎤 Мікрофон  UK→EN", True)
-        self.b_tts = self._btn("🔊 Озвучувати", True)
-        self.b_tts.setToolTip("Озвучувати англійський переклад моєї мови")
-        for b in (self.b_sys, self.b_mic, self.b_tts):
-            bar.addWidget(b)
+        # Верхня панель керування
+        top = QHBoxLayout()
+        top.setSpacing(6)
+
+        # Іконка-логотип у кутку оверлею
+        if config.ICON_PNG.exists():
+            logo = QLabel()
+            pix = QPixmap(str(config.ICON_PNG)).scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo.setPixmap(pix)
+            logo.setToolTip(f"RealDub v{__version__} — офлайн перекладач мовлення")
+            top.addWidget(logo)
+            top.addSpacing(2)
+
+        self.b_sys = self._btn("🎧 Звук ПК EN→UK", True)
+        self.b_sys.setToolTip("Перекладати звук із комп'ютера (відео, Zoom, Meet, ігри) з англійської на українську")
+
+        self.b_mic = self._btn("🎤 Мікрофон UK→EN", True)
+        self.b_mic.setObjectName("mic")
+        self.b_mic.setToolTip("Перекладати ваш голос із мікрофона з української на англійську")
+
+        self.b_tts = self._btn("🔊 Озвучка", True)
+        self.b_tts.setToolTip("Озвучувати перекладений англійський текст голосом")
+
+        # Вибір моделі Whisper
+        self.cmb_model = QComboBox()
+        self.cmb_model.setCursor(Qt.PointingHandCursor)
+        self.cmb_model.setToolTip("Модель розпізнавання мовлення Whisper (більша модель = вища точність)")
+        cur_m = self.cfg.get("whisper_model", "large-v3-turbo")
+        for idx, (m_key, (m_label, _)) in enumerate(config.WHISPER_MODELS.items()):
+            self.cmb_model.addItem(m_label, userData=m_key)
+            if m_key == cur_m:
+                self.cmb_model.setCurrentIndex(idx)
+
+        # Кнопки розміру шрифту
+        b_font_down = self._btn("A−", False)
+        b_font_down.setToolTip("Зменшити розмір шрифту")
+        b_font_down.clicked.connect(lambda: self._change_font(-2))
+
+        b_font_up = self._btn("A+", False)
+        b_font_up.setToolTip("Збільшити розмір шрифту")
+        b_font_up.clicked.connect(lambda: self._change_font(+2))
 
         self.b_upd = self._btn("🔄", False)
         self.b_upd.setToolTip("Перевірити та встановити оновлення з GitHub")
         self.b_upd.clicked.connect(self._on_update_click)
-        bar.addWidget(self.b_upd)
 
-        clr = self._btn("🧹", False)
-        clr.setToolTip("Очистити субтитри")
-        clr.clicked.connect(self._clear)
-        close = self._btn("✕", False)
-        close.setToolTip("Закрити програму та вивантажити з пам'яті")
-        close.clicked.connect(self._quit_app)
-        bar.addWidget(clr)
-        bar.addWidget(close)
-        lay.addLayout(bar)
+        b_copy = self._btn("📋", False)
+        b_copy.setToolTip("Скопіювати останній переклад у буфер обміну")
+        b_copy.clicked.connect(self._copy_last)
 
+        b_clr = self._btn("🧹", False)
+        b_clr.setToolTip("Очистити субтитри")
+        b_clr.clicked.connect(self._clear)
+
+        b_quit = self._btn("✕", False)
+        b_quit.setObjectName("close")
+        b_quit.setToolTip("Закрити RealDub і вивантажити з пам'яті")
+        b_quit.clicked.connect(self._quit_app)
+
+        self.st = QLabel("⏳ Завантаження моделей…")
+        self.st.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 500;")
+        self.st.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        for w_item in (self.b_sys, self.b_mic, self.b_tts, self.cmb_model, b_font_down, b_font_up):
+            top.addWidget(w_item)
+        top.addSpacing(4)
+        top.addWidget(self.st, 1)
+        for w_item in (b_copy, self.b_upd, b_clr, b_quit):
+            top.addWidget(w_item)
+        lay.addLayout(top)
+
+        # Поле субтитрів (прозоре для миші, щоб вікно легко перетягувалося за будь-яке місце)
         self.text = QLabel()
         self.text.setWordWrap(True)
-        self.text.setTextFormat(Qt.RichText)
-        self.text.setAlignment(Qt.AlignBottom | Qt.AlignLeft)
-        self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.text.setMinimumHeight(90)
-        self.text.setFont(QFont("Segoe UI", cfg["font_size"]))
-        # Дозволяємо перетягувати вікно прямо за область тексту субтитрів
+        self.text.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.text.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         lay.addWidget(self.text, 1)
 
+        # Нижня панель: поле ручного вводу слова або речення + кнопка перекладу + зміна розміру
         row = QHBoxLayout()
-        self.inp = QLineEdit(placeholderText="Напишіть українською — перекладу англійською й озвучу…")
+        row.setSpacing(6)
+        self.inp = QLineEdit()
+        self.inp.setPlaceholderText("✍️ Введіть слово або фразу (укр ↔ англ) і натисніть Enter…")
         self.inp.returnPressed.connect(self._typed)
+
+        b_send = QPushButton("Перекласти ➤")
+        b_send.setObjectName("send")
+        b_send.setCursor(Qt.PointingHandCursor)
+        b_send.clicked.connect(self._typed)
+
         row.addWidget(self.inp, 1)
+        row.addWidget(b_send)
         row.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         lay.addLayout(row)
 
@@ -149,11 +276,39 @@ class Overlay(QWidget):
         self._drag = None
         self.on_typed = None
         self.on_shutdown = None
+        self.on_model_change = None
+        self.cmb_model.currentIndexChanged.connect(self._on_model_selected)
         self._timer = QTimer(self, interval=2000, timeout=self._expire)
         self._timer.start()
 
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor(11, 15, 27, int(self.cfg["opacity"] * 255)))
+        p.setPen(QColor(148, 163, 184, 48))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
+
+    def _change_font(self, delta: int):
+        new_fs = max(14, min(36, self.cfg.get("font_size", 21) + delta))
+        self.cfg["font_size"] = new_fs
+        self.cfg["orig_font_size"] = max(13, new_fs - 3)
+        config.save(self.cfg)
+        self._render()
+
+    def _copy_last(self):
+        if self.lines:
+            _, orig, trans, _ = self.lines[-1]
+            # Прибираємо синонім після " · ", якщо копіюємо для вставки
+            clean_tr = trans.split("  ·  ")[0].strip()
+            QGuiApplication.clipboard().setText(clean_tr)
+            self.st.setText(f"📋 Скопійовано: {clean_tr[:35]}")
+
+    def _on_model_selected(self, idx: int):
+        m_key = self.cmb_model.itemData(idx)
+        if m_key and self.on_model_change:
+            self.on_model_change(m_key)
+
     def _on_engine_ready(self):
-        # Автоматично вмикаємо прослуховування звуку ПК після готовності моделей
         if self.cfg.get("auto_listen_system", True) and not self.b_sys.isChecked() and not self.b_mic.isChecked():
             self.b_sys.setChecked(True)
 
@@ -207,7 +362,6 @@ class Overlay(QWidget):
         threading.Thread(target=task, daemon=True).start()
 
     def _restart_now(self):
-        """Перезапускає програму після оновлення, звільняючи старий процес."""
         if self.on_shutdown:
             self.on_shutdown()
         _remove_pid_file()
@@ -261,15 +415,13 @@ class Overlay(QWidget):
         self._render()
 
     def _expire(self):
-        # Під час перетягування вікна не чіпаємо рядки, щоб нічого не блимало і не зникало
         if self._drag is not None:
             return
         ttl = self.cfg.get("line_ttl_sec", 120)
-        if ttl <= 0 or len(self.lines) <= 1:
+        if ttl <= 0 or len(self.lines) <= 2:
             return
         now = time.time()
         keep = [l for l in self.lines if now - l[3] < ttl]
-        # Завжди залишаємо щонайменше 2 останні репліки, щоб вікно ніколи не пустіло само по собі
         if len(keep) < 2:
             keep = self.lines[-2:]
         if len(keep) != len(self.lines):
@@ -277,24 +429,40 @@ class Overlay(QWidget):
             self._render()
 
     def _render(self):
-        fs = self.cfg["font_size"]
+        fs = self.cfg.get("font_size", 21)
+        orig_fs = self.cfg.get("orig_font_size", max(16, fs - 3))
 
         def block(d, o, t, live=False):
-            color = "#ffffff" if d == "in" else "#68ffa8"
-            tag = "EN → UK" if d == "in" else "UK → EN"
-            op = "0.75" if live else "1.0"
-            live_badge = "<span style='color:#f59e0b; font-size:11px; font-weight:600;'> ⚡ мовлення…</span>" if live else ""
-            return (
-                f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
-                f"<span style='color:#94a3b8; font-size:{max(11, fs - 7)}pt;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
-                f"<span style='color:{color}; font-size:{fs}pt; font-weight:500;'>{_esc(t)}</span>"
-                f"</div>"
-            )
+            op = "0.78" if live else "1.0"
+            live_badge = "<span style='color:#fbbf24; font-size:12px; font-weight:600;'> ⚡ мовлення…</span>" if live else ""
+            if d == "in":
+                # Звук ПК (EN -> UK): англійський оригінал більшим і чітким шрифтом, знизу український переклад
+                tag = "<span style='color:#38bdf8; font-weight:700;'>EN → UK</span>"
+                return (
+                    f"<div style='margin-bottom:10px; opacity:{op}; line-height:1.28;'>"
+                    f"<span style='font-size:{orig_fs}pt; color:#cbd5e1; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
+                    f"<span style='color:#ffffff; font-size:{fs}pt; font-weight:600;'>{_esc(t)}</span>"
+                    f"</div>"
+                )
+            else:
+                # Мікрофон або ввід тексту (UK -> EN): український оригінал зверху, англійський переклад крупним шрифтом знизу
+                tag = "<span style='color:#34d399; font-weight:700;'>UK → EN</span>"
+                en_fs = fs + 1
+                return (
+                    f"<div style='margin-bottom:10px; opacity:{op}; line-height:1.28;'>"
+                    f"<span style='font-size:{max(15, orig_fs - 1)}pt; color:#94a3b8; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
+                    f"<span style='color:#68ffa8; font-size:{en_fs}pt; font-weight:600;'>{_esc(t)}</span>"
+                    f"</div>"
+                )
 
         html = "".join(block(*l[:3]) for l in self.lines)
         html += "".join(block(d, o, t, True) for d, (o, t) in self.partial.items() if o and t)
         self.text.setText(
-            html or f"<span style='color:#64748b; font-size:{max(12, fs - 5)}pt;'>Слухаю… Увімкніть відео/конференцію або говоріть у мікрофон.</span>"
+            html or (
+                f"<span style='color:#94a3b8; font-size:{max(13, fs - 5)}pt;'>"
+                f"🎧 Слухаю звук ПК… Увімкніть відео/конференцію, говоріть у мікрофон або введіть слово знизу."
+                f"</span>"
+            )
         )
 
     def mousePressEvent(self, e):
@@ -361,6 +529,7 @@ class Pipeline:
         self.lanes = {"in": Lane(), "out": Lane()}
         self.typed = queue.Queue()
         self._stopped = False
+        self._switching_model = False
         mk = lambda d: Segmenter(lambda a, f: self.lanes[d].put(a, f), cfg["min_level"],
                                  cfg["silence_sec"], cfg["max_phrase_sec"], cfg["live_partial"])
         self.cap_sys = Capture("system", mk("in"), cfg)
@@ -369,6 +538,7 @@ class Pipeline:
         ui.b_mic.toggled.connect(lambda v: setattr(self.cap_mic, "enabled", v))
         ui.on_typed = self.typed.put
         ui.on_shutdown = self.shutdown
+        ui.on_model_change = self.change_whisper_model
         threading.Thread(target=self._load, daemon=True).start()
 
     def _check_update_bg(self):
@@ -382,24 +552,41 @@ class Pipeline:
 
     def _load(self):
         try:
-            from realdub.engine import NLLB, Recognizer, Speaker, Translator
-            self.asr = Recognizer(self.cfg)
+            from realdub.engine import NLLB, Recognizer, Speaker, Translator, WordAndTextTranslator
+            self.asr = Recognizer(self.cfg, on_status=self.bus.status.emit)
             gpu = "GPU" in self.asr.device
+            nllb = None
+            opus_uk_en = None
+            opus_en_uk = None
             try:
                 nllb = NLLB(gpu)
                 self.en_uk, self.uk_en = nllb.make("en", "uk"), nllb.make("uk", "en")
             except Exception:
-                self.en_uk = Translator("en", "uk", gpu)
-                self.uk_en = Translator("uk", "en", gpu)
+                pass
+            try:
+                opus_en_uk = Translator("en", "uk", gpu)
+                opus_uk_en = Translator("uk", "en", gpu)
+                if not hasattr(self, "en_uk"):
+                    self.en_uk, self.uk_en = opus_en_uk, opus_uk_en
+            except Exception:
+                pass
+
+            self.word_tr = WordAndTextTranslator(
+                nllb=nllb,
+                opus_uk_en=opus_uk_en,
+                opus_en_uk=opus_en_uk,
+                fallback_uk_en=self.uk_en,
+                fallback_en_uk=self.en_uk,
+            )
             self.tts = Speaker(self.cfg)
-            self.asr(np.zeros(16000, np.float32), "en")  # прогрів
+            self.asr(np.zeros(16000, np.float32), "en", fast=True)  # прогрів
         except StopIteration:
-            self.bus.status.emit("❌ Моделі не знайдено — запустіть setup.bat")
+            self.bus.status.emit("❌ Моделі не знайдено — запустіть установник")
             return
         except Exception as e:
             self.bus.status.emit(f"❌ Помилка: {e}")
             return
-        self.bus.status.emit(f"✅ Готово · {self.asr.device} · офлайн")
+        self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {self.asr.device}")
         self.bus.ready.emit()
         if self.cfg.get("check_updates_on_start", True):
             threading.Thread(target=self._check_update_bg, daemon=True).start()
@@ -407,13 +594,42 @@ class Pipeline:
             threading.Thread(target=self._loop, args=(d,), daemon=True).start()
         threading.Thread(target=self._typed_loop, daemon=True).start()
 
+    def change_whisper_model(self, new_model: str):
+        """Динамічна заміна моделі Whisper без перезапуску програми."""
+        if self._switching_model or new_model == self.cfg.get("whisper_model"):
+            return
+
+        def worker():
+            self._switching_model = True
+            try:
+                from realdub.engine import Recognizer
+                self.cfg["whisper_model"] = new_model
+                config.save(self.cfg)
+                self.bus.status.emit(f"⏳ Перемикаю на Whisper {new_model}…")
+                old_asr = getattr(self, "asr", None)
+                new_asr = Recognizer(self.cfg, on_status=self.bus.status.emit)
+                self.asr = new_asr
+                del old_asr
+                gc.collect()
+                self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {self.asr.device}")
+            except Exception as e:
+                self.bus.status.emit(f"⚠ Помилка зміни моделі: {e}")
+            finally:
+                self._switching_model = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _typed_loop(self):
         while not self._stopped:
             t = self.typed.get()
             if self._stopped:
                 break
             try:
-                self._emit("out", t, self.uk_en(t), True)
+                d, disp, speak_txt = self.word_tr.translate(t)
+                if disp:
+                    self.bus.line.emit(d, t, disp, True)
+                    if d == "out" and self.ui.b_tts.isChecked() and speak_txt:
+                        threading.Thread(target=self._speak, args=(speak_txt,), daemon=True).start()
             except Exception as e:
                 self.bus.status.emit(f"⚠ {e}")
 
@@ -432,7 +648,7 @@ class Pipeline:
                 continue
             try:
                 t0 = time.time()
-                orig = self.asr(audio, "en" if d == "in" else "uk")
+                orig = self.asr(audio, "en" if d == "in" else "uk", fast=not final)
                 if not final and lane.finals:
                     continue
                 if not orig:
@@ -451,6 +667,14 @@ class Pipeline:
                         tr = mt(orig)
                 else:
                     last_partial_orig = ""
+                    # Якщо в мікрофон сказано 1-2 слова — використовуємо словниковий перекладач для точності
+                    if d == "out" and len(orig.split()) <= 2 and hasattr(self, "word_tr"):
+                        _, tr, speak_txt = self.word_tr.translate(orig)
+                        self.bus.line.emit(d, orig, tr, True)
+                        if self.ui.b_tts.isChecked() and speak_txt:
+                            threading.Thread(target=self._speak, args=(speak_txt,), daemon=True).start()
+                        self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {time.time() - t0:.1f} с")
+                        continue
                     try:
                         tr = mt(orig, fast=False)
                     except TypeError:
@@ -458,7 +682,7 @@ class Pipeline:
 
                 self._emit(d, orig, tr, final)
                 if final:
-                    self.bus.status.emit(f"✅ {self.asr.device} · затримка {time.time() - t0:.1f} с")
+                    self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {time.time() - t0:.1f} с")
             except Exception as e:
                 self.bus.status.emit(f"⚠ {e}")
 
@@ -493,17 +717,24 @@ class Pipeline:
             reset_pyaudio_instance()
         except Exception:
             pass
-        for attr in ("asr", "en_uk", "uk_en", "tts"):
+        for attr in ("asr", "en_uk", "uk_en", "word_tr", "tts"):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         gc.collect()
 
 
 def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RealDub.Translator.2.2")
+        except Exception:
+            pass
     _ensure_single_instance()
     cfg = config.load()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    if config.ICON_ICO.exists():
+        app.setWindowIcon(QIcon(str(config.ICON_ICO)))
     bus = Bus()
     ui = Overlay(cfg, bus)
     ui._render()

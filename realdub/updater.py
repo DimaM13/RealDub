@@ -126,7 +126,7 @@ def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
         fetch_res = _run_git(["fetch", "origin", "main", "--quiet"], cwd=target_dir, timeout=25)
         if fetch_res.returncode == 0:
             chk_res = _run_git(
-                ["checkout", "origin/main", "--", "realdub", "main.pyw", "download_models.py", "requirements.txt", "start.bat", "README.md"],
+                ["checkout", "origin/main", "--", "realdub", "RealDub.exe", "main.pyw", "download_models.py", "requirements.txt", "start.bat", "README.md"],
                 cwd=target_dir,
                 timeout=20,
             )
