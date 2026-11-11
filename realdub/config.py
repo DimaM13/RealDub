@@ -10,15 +10,13 @@ ICON_PNG = Path(__file__).resolve().parent / "icon.png"
 
 # Доступні моделі розпізнавання Whisper (код -> (Назва в меню, HuggingFace репозиторій))
 WHISPER_MODELS = {
-    "small": ("⚡ Small (Легка)", "Systran/faster-whisper-small"),
     "medium": ("🎯 Medium (Точна)", "Systran/faster-whisper-medium"),
-    "large-v3-turbo": ("🚀 Large-Turbo (Найкраща)", "Lunaxod/large-v3-turbo-faster-whisper"),
-    "large-v3": ("💎 Large-v3 (Максимум)", "Systran/faster-whisper-large-v3"),
+    "small": ("⚡ Small (Швидка)", "Systran/faster-whisper-small"),
 }
 
 DEFAULTS = {
-    # Модель розпізнавання: small / medium / large-v3-turbo / large-v3
-    "whisper_model": "large-v3-turbo",
+    # Модель розпізнавання за замовчуванням: medium (точна) або small (швидка)
+    "whisper_model": "medium",
     # "auto" — відеокарта NVIDIA, якщо є, інакше процесор
     "device": "auto",
     # Пристрій виводу для озвучення (частина назви, напр. "CABLE Input"); "" — типовий
@@ -33,26 +31,26 @@ DEFAULTS = {
     "live_partial": True,
     # Основний розмір шрифту перекладу (pt)
     "font_size": 21,
-    # Розмір шрифту оригіналу / англійського тексту (відносно основного: 0 = авто fs-2)
+    # Розмір шрифту оригіналу / англійського тексту (pt)
     "orig_font_size": 18,
     "opacity": 0.86,
-    "max_lines": 4,
+    "max_lines": 5,
     # Через скільки секунд застарілі рядки зникають (останні 2 завжди залишаються)
     "line_ttl_sec": 120,
     # Автоматично вмикати захоплення звуку ПК при запуску
     "auto_listen_system": True,
-    # Автоматично перевіряти оновлення на GitHub при старті
+    # Автоматично перевіряти оновлення на GitHub при старті (якщо є інтернет)
     "check_updates_on_start": True,
 }
 
 # Версія налаштувань: при зміні старий config.json оновлюється новими типовими значеннями
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 
 # Голоси Piper (офлайн синтез мовлення)
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 VOICES = {
     "uk": "uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium",
-    "en": "en/en_US/lessac/medium/en_US-lessac-medium",
+    "en": "en/en_US/lessac/medium/uk_UA-ukrainian_tts-medium" if False else "en/en_US/lessac/medium/en_US-lessac-medium",
 }
 
 
@@ -64,11 +62,13 @@ def load() -> dict:
             if user.get("version") == CONFIG_VERSION:
                 cfg.update(user)
             else:
-                for k in ("device", "tts_output_device"):
+                for k in ("device", "tts_output_device", "font_size", "orig_font_size"):
                     if k in user:
                         cfg[k] = user[k]
         except Exception:
             pass
+    if cfg.get("whisper_model") not in WHISPER_MODELS:
+        cfg["whisper_model"] = "medium"
     cfg["version"] = CONFIG_VERSION
     save(cfg)
     return cfg

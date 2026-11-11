@@ -1,10 +1,8 @@
-"""Одноразове завантаження моделей (потрібен інтернет лише один раз).
-Після цього RealDub працює повністю офлайн."""
+"""Перевірка та одноразове завантаження моделей ШІ.
+Якщо моделі вже є у папці models/ (як в установнику), інтернет взагалі не потрібен."""
 import io
 import sys
 import zipfile
-
-import requests
 
 from realdub import config
 
@@ -12,6 +10,7 @@ ARGOS_INDEX = "https://raw.githubusercontent.com/argosopentech/argospm-index/mai
 
 
 def fetch(url: str) -> bytes:
+    import requests
     print(f"  ↓ {url}")
     r = requests.get(url, timeout=120)
     r.raise_for_status()
@@ -24,14 +23,9 @@ def get_whisper(name: str):
         print(f"✓ Whisper {name} вже є")
         return
     print(f"• Завантажую Whisper {name}…")
-    repo = config.WHISPER_MODELS.get(name, (name, None))[1]
-    if repo:
-        from huggingface_hub import snapshot_download
-        out.mkdir(parents=True, exist_ok=True)
-        snapshot_download(repo, local_dir=str(out))
-    else:
-        from faster_whisper import download_model
-        download_model(name, output_dir=str(out))
+    from faster_whisper import download_model
+    out.mkdir(parents=True, exist_ok=True)
+    download_model(name, output_dir=str(out))
 
 
 def get_translator(src: str, dst: str, index: list):
@@ -80,10 +74,11 @@ def get_nllb():
 if __name__ == "__main__":
     cfg = config.load()
     config.MODELS.mkdir(exist_ok=True)
-    get_whisper(cfg["whisper_model"])
+    get_whisper("medium")
     get_whisper("small")
     get_nllb()
     if not (config.MODELS / "mt-en-uk").exists() or not (config.MODELS / "mt-uk-en").exists():
+        import requests
         index = requests.get(ARGOS_INDEX, timeout=60).json()
         get_translator("en", "uk", index)
         get_translator("uk", "en", index)
@@ -91,4 +86,4 @@ if __name__ == "__main__":
         print("✓ Словникові моделі en↔uk вже є")
     get_voice("uk")
     get_voice("en")
-    print("\nГотово! Тепер можна запускати без інтернету.")
+    print("\nГотово! Усі моделі на місці для 100% автономної офлайн-роботи.")

@@ -1,5 +1,5 @@
-"""ШІ-рушій: Faster-Whisper (Small / Medium / Large-v3-Turbo), NLLB-200, Opus-MT (для слів), Piper TTS.
-Оптимізовано для Windows (NVIDIA CUDA або процесор)."""
+"""ШІ-рушій: Faster-Whisper (Medium / Small), NLLB-200, Opus-MT (для слів), Piper TTS.
+Працює повністю автономно офлайн на Windows (NVIDIA CUDA або процесор)."""
 import io
 import os
 import re
@@ -101,26 +101,27 @@ def _has_cuda() -> bool:
 
 
 def ensure_whisper_model(model_name: str, on_status=None) -> Path:
-    """Перевіряє наявність моделі Whisper; за потреби завантажує її або бере наявну."""
+    """Перевіряє локальну модель Whisper (medium або small)."""
+    if model_name not in ("medium", "small"):
+        model_name = "medium"
     out = config.MODELS / f"whisper-{model_name}"
     if (out / "model.bin").exists():
         return out
 
-    repo = config.WHISPER_MODELS.get(model_name, (model_name, None))[1]
-    if repo:
-        try:
-            if on_status:
-                on_status(f"📥 Завантажую модель Whisper ({model_name})… Зачекайте")
-            from huggingface_hub import snapshot_download
-            out.mkdir(parents=True, exist_ok=True)
-            snapshot_download(repo, local_dir=str(out))
-            if (out / "model.bin").exists():
-                return out
-        except Exception:
-            pass
+    # Якщо раптом моделі ще немає на диску і є інтернет — довантажуємо
+    try:
+        if on_status:
+            on_status(f"📥 Завантажую модель Whisper {model_name.capitalize()}…")
+        from faster_whisper import download_model
+        out.mkdir(parents=True, exist_ok=True)
+        download_model(model_name, output_dir=str(out))
+        if (out / "model.bin").exists():
+            return out
+    except Exception:
+        pass
 
-    # Якщо немає інтернету — шукаємо будь-яку вже встановлену модель Whisper
-    for fallback in ("large-v3-turbo", "medium", "small", "base", "tiny"):
+    # Автономний офлайн-резерв: беремо наявну локальну модель
+    for fallback in ("medium", "small"):
         fb_dir = config.MODELS / f"whisper-{fallback}"
         if (fb_dir / "model.bin").exists():
             return fb_dir
@@ -128,24 +129,25 @@ def ensure_whisper_model(model_name: str, on_status=None) -> Path:
 
 
 class Recognizer:
-    """Розпізнавання мовлення через faster-whisper (NVIDIA GPU або процесор)."""
+    """Офлайн розпізнавання мовлення через faster-whisper (NVIDIA GPU або процесор)."""
 
     def __init__(self, cfg, on_status=None):
         from faster_whisper import WhisperModel
-        self.model_name = cfg.get("whisper_model", "large-v3-turbo")
-        path = ensure_whisper_model(self.model_name, on_status=on_status)
+        req_name = cfg.get("whisper_model", "medium")
+        path = ensure_whisper_model(req_name, on_status=on_status)
         self.model_name = path.name.replace("whisper-", "")
+        self.display_name = "Medium" if self.model_name == "medium" else "Small"
         want_cuda = cfg["device"] == "cuda" or (cfg["device"] == "auto" and _has_cuda())
 
         if want_cuda:
             try:
-                self.model = WhisperModel(str(path), device="cuda", compute_type="int8_float16")
+                self.model = WhisperModel(str(path), device="cuda", compute_type="int8_float16", local_files_only=True)
                 self.device = "NVIDIA GPU"
             except Exception:
-                self.model = WhisperModel(str(path), device="cpu", compute_type="int8")
+                self.model = WhisperModel(str(path), device="cpu", compute_type="int8", local_files_only=True)
                 self.device = "процесор"
         else:
-            self.model = WhisperModel(str(path), device="cpu", compute_type="int8")
+            self.model = WhisperModel(str(path), device="cpu", compute_type="int8", local_files_only=True)
             self.device = "процесор"
 
         self.lock = threading.Lock()
@@ -179,7 +181,7 @@ NLLB_CODES = {"en": "eng_Latn", "uk": "ukr_Cyrl"}
 
 
 class NLLB:
-    """Модель NLLB-200 для живого перекладу речень (CUDA або CPU)."""
+    """Офлайн модель NLLB-200 для живого перекладу речень (CUDA або CPU)."""
 
     def __init__(self, use_gpu: bool = False):
         import ctranslate2
@@ -229,8 +231,6 @@ class NLLB:
                 clean_s = s_item.strip()
                 w_list = clean_s.split()
                 max_words = max(max_words, len(w_list))
-                # Додаємо крапку або знак питання лише для повноцінних речень (від 4 слів),
-                # щоб на 1-3 словах модель не додумувала зайві фрази
                 if len(w_list) >= 4 and clean_s[-1] not in ".!?…":
                     first_w = w_list[0].lower().strip(".,:;!?")
                     clean_s += "?" if first_w in starters else "."
@@ -257,7 +257,7 @@ class NLLB:
 
 
 class Translator:
-    """Спеціалізований швидкий перекладач Opus-MT (відмінно перекладає окремі слова та короткі фрази)."""
+    """Спеціалізований офлайн перекладач Opus-MT (відмінно перекладає окремі слова та короткі фрази)."""
 
     def __init__(self, src: str, dst: str, use_gpu: bool = False):
         import ctranslate2
@@ -298,7 +298,7 @@ class Translator:
 
 
 class WordAndTextTranslator:
-    """Розумний перекладач для поля вводу (підтримує окремі слова зі словниковими синонімами та речення).
+    """Повністю офлайн перекладач для поля вводу (підтримує окремі слова зі словниковими синонімами та речення).
     Автоматично визначає мову вводу (УКР → АНГЛ або АНГЛ → УКР)."""
 
     def __init__(self, nllb: NLLB | None, opus_uk_en: Translator | None, opus_en_uk: Translator | None,
@@ -341,7 +341,7 @@ class WordAndTextTranslator:
                 tr = self.fb_uk_en(text, fast=False)
                 return "out", tr, tr
         else:
-            # Англійська -> Українська (коли користувач ввів англійське слово або фразу)
+            # Англійська -> Українська
             if len(words) == 1 and self.nllb is not None:
                 primary = self.nllb.translate_raw(clean_word, "en", "uk", max_len=12).strip(" .!?")
                 if self.opus_en_uk is not None:

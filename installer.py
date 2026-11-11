@@ -191,17 +191,6 @@ class InstallWorker(threading.Thread):
             self.on_step("Перевіряю та налаштовую моделі ШІ…", 85)
             subprocess.run([venv_python, str(self.target / "download_models.py")], cwd=str(self.target), check=True)
 
-            # Ініціалізуємо git-зв'язок для надійних наступних автооновлень
-            try:
-                subprocess.run(["git", "init"], cwd=str(self.target), capture_output=True)
-                subprocess.run(
-                    ["git", "remote", "add", "origin", "https://github.com/DimaM13/RealDub.git"],
-                    cwd=str(self.target),
-                    capture_output=True,
-                )
-            except Exception:
-                pass
-
             # Створення деінсталятора
             uninst_file = self.target / "uninstall.bat"
             uninst_content = (

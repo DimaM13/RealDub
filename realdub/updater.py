@@ -1,21 +1,13 @@
-"""Модуль автоматичного оновлення RealDub через Git та GitHub API.
-Підтримує перевірку оновлень та безпечне застосування в 1 клік."""
+"""Модуль автоматичного оновлення RealDub.
+Безпечно перевіряє та застосовує оновлення, якщо налаштовано репозиторій оновлень."""
 import io
 import json
-import os
 import re
 import shutil
 import subprocess
-import sys
 import urllib.request
 import zipfile
 from pathlib import Path
-
-GITHUB_REPO = "DimaM13/RealDub"
-REPO_URL = f"https://github.com/{GITHUB_REPO}.git"
-API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-TAGS_URL = f"https://api.github.com/repos/{GITHUB_REPO}/tags"
-ZIP_URL = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip"
 
 _NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -31,8 +23,28 @@ def _run_git(args: list[str], cwd: Path = None, timeout: int = 10):
     )
 
 
+def _get_repo_url(target_dir: Path) -> str:
+    """Отримує URL репозиторію з локального .git або config.json без вшивання особистих даних у код."""
+    try:
+        cfg_file = target_dir / "config.json"
+        if cfg_file.exists():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if data.get("update_repo_url"):
+                return data["update_repo_url"]
+    except Exception:
+        pass
+    try:
+        if (target_dir / ".git").exists():
+            res = _run_git(["config", "--get", "remote.origin.url"], cwd=target_dir, timeout=4)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def parse_version(v_str: str) -> tuple:
-    """Перетворює рядок версії на зразок 'v2.1.2' у кортеж чисел для порівняння (2, 1, 2)."""
+    """Перетворює рядок версії на зразок 'v2.2.1' у кортеж чисел для порівняння (2, 2, 1)."""
     clean = v_str.strip().lstrip("vV")
     parts = []
     for x in clean.split("."):
@@ -42,14 +54,17 @@ def parse_version(v_str: str) -> tuple:
 
 
 def check_for_updates(current_version: str, target_dir: Path = None) -> dict | None:
-    """Перевіряє наявність новішої версії на GitHub.
-    Працює як для публічних, так і для приватних репозиторіїв (через Git)."""
+    """Перевіряє наявність новішої версії у підключеному репозиторії."""
     if target_dir is None:
         target_dir = Path(__file__).resolve().parent.parent
 
-    # 1. Перевіряємо віддалені теги через git ls-remote (працює навіть без локального .git)
+    repo_url = _get_repo_url(target_dir)
+    if not repo_url:
+        return None
+
+    # 1. Перевіряємо віддалені теги через git ls-remote
     try:
-        res = _run_git(["ls-remote", "--tags", REPO_URL], timeout=8)
+        res = _run_git(["ls-remote", "--tags", repo_url], timeout=8)
         if res.returncode == 0 and res.stdout:
             tags = re.findall(r"refs/tags/(v\d+\.\d+(?:\.\d+)?)", res.stdout)
             if tags:
@@ -74,37 +89,18 @@ def check_for_updates(current_version: str, target_dir: Path = None) -> dict | N
             if behind_count > 0:
                 return {
                     "version": f"+{behind_count} оновлень",
-                    "name": "Нові зміни на GitHub",
-                    "body": f"Доступно {behind_count} нових комітів у гілці main.",
+                    "name": "Нові зміни",
+                    "body": f"Доступно {behind_count} нових оновлень у гілці main.",
                     "method": "git",
                 }
         except Exception:
             pass
 
-    # 3. Через публічний GitHub API
-    headers = {"User-Agent": "RealDub-App"}
-    try:
-        req = urllib.request.Request(API_URL, headers=headers)
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8"))
-                tag = data.get("tag_name", "")
-                if parse_version(tag) > parse_version(current_version):
-                    return {
-                        "version": tag,
-                        "name": data.get("name") or tag,
-                        "body": data.get("body", "Оновлення коду."),
-                        "method": "api",
-                    }
-    except Exception:
-        pass
-
     return None
 
 
 def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
-    """Завантажує та застосовує оновлення.
-    Безпечно оновлює код програми, зберігаючи моделі (models/) та налаштування (config.json)."""
+    """Завантажує та застосовує оновлення, зберігаючи моделі (models/) та налаштування (config.json)."""
     if target_dir is None:
         target_dir = Path(__file__).resolve().parent.parent
 
@@ -112,16 +108,19 @@ def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
         if on_progress:
             on_progress(msg)
 
+    repo_url = _get_repo_url(target_dir)
+    if not repo_url:
+        return False, f"✅ Автономна офлайн-версія (усі моделі активні)"
+
     git_dir = target_dir / ".git"
 
-    # 1. Оновлюємо код через Git (працює і для приватного, і для публічного репозиторію)
     try:
-        report("Синхронізую файли з GitHub...")
+        report("Синхронізую файли з репозиторієм...")
         if not git_dir.exists():
             _run_git(["init"], cwd=target_dir, timeout=5)
-            _run_git(["remote", "add", "origin", REPO_URL], cwd=target_dir, timeout=5)
+            _run_git(["remote", "add", "origin", repo_url], cwd=target_dir, timeout=5)
         else:
-            _run_git(["remote", "set-url", "origin", REPO_URL], cwd=target_dir, timeout=5)
+            _run_git(["remote", "set-url", "origin", repo_url], cwd=target_dir, timeout=5)
 
         fetch_res = _run_git(["fetch", "origin", "main", "--quiet"], cwd=target_dir, timeout=25)
         if fetch_res.returncode == 0:
@@ -133,37 +132,7 @@ def apply_update(target_dir: Path = None, on_progress=None) -> tuple[bool, str]:
             if chk_res.returncode == 0:
                 _run_git(["reset", "--mixed", "origin/main"], cwd=target_dir, timeout=5)
                 return True, "✅ Оновлено! Перезапускаю RealDub…"
-    except Exception:
-        pass
-
-    # 2. Резервний спосіб через ZIP (якщо репозиторій відкритий)
-    try:
-        report("Завантажую архів оновлення з GitHub...")
-        headers = {"User-Agent": "RealDub-App"}
-        req = urllib.request.Request(ZIP_URL, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            zip_bytes = resp.read()
-
-        report("Застосовую файли оновлення...")
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            names = zf.namelist()
-            root_prefix = names[0].split("/")[0] + "/"
-
-            for member in zf.infolist():
-                if member.is_dir():
-                    continue
-                rel_path = member.filename[len(root_prefix):]
-                if not rel_path:
-                    continue
-
-                if rel_path == "config.json" or rel_path.startswith("models/") or rel_path.startswith(".venv/"):
-                    continue
-
-                dest_file = target_dir / rel_path
-                dest_file.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src_f, open(dest_file, "wb") as dst_f:
-                    shutil.copyfileobj(src_f, dst_f)
-
-        return True, "✅ Оновлено! Перезапускаю RealDub…"
     except Exception as e:
         return False, f"❌ Помилка оновлення: {e}"
+
+    return False, "❌ Не вдалося з'єднатися з сервером оновлень"

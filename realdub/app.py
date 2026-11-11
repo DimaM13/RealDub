@@ -1,5 +1,5 @@
 """Прозорий оверлей поверх усіх вікон та конвеєр живого перекладу.
-Оптимізовано для Windows: сучасний інтерфейс, вибір потужності Whisper, словниковий переклад слів та чисте вивантаження з ОЗП/VRAM."""
+Працює повністю автономно офлайн на Windows: швидке перемикання Whisper (Medium / Small), адаптивна прокрутка тексту за будь-якого розміру вікна та повне очищення ОЗП/VRAM при виході."""
 import ctypes
 import gc
 import os
@@ -12,9 +12,9 @@ import time
 import numpy as np
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSizeGrip, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout,
+                               QLabel, QLineEdit, QPushButton, QScrollArea,
+                               QSizeGrip, QVBoxLayout, QWidget)
 
 from realdub import __version__, config
 from realdub.audio import Capture, Segmenter, reset_pyaudio_instance
@@ -103,6 +103,10 @@ QLineEdit:focus {
     border-color: #60a5fa;
     background: rgba(15, 23, 42, 235);
 }
+QScrollArea {
+    background: transparent;
+    border: none;
+}
 """
 
 PID_FILE = config.ROOT / "realdub.pid"
@@ -163,24 +167,24 @@ class Overlay(QWidget):
         self.setStyleSheet(STYLE)
 
         scr = QGuiApplication.primaryScreen().availableGeometry()
-        w, h = min(980, int(scr.width() * 0.66)), 275
+        w, h = min(980, int(scr.width() * 0.66)), 280
         self.setGeometry(scr.center().x() - w // 2, scr.bottom() - h - 48, w, h)
-        self.setMinimumSize(640, 185)
+        self.setMinimumSize(480, 145)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 12, 16, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(16, 10, 16, 10)
+        lay.setSpacing(6)
 
         # Верхня панель керування
         top = QHBoxLayout()
         top.setSpacing(6)
 
-        # Іконка-логотип у кутку оверлею
         if config.ICON_PNG.exists():
             logo = QLabel()
             pix = QPixmap(str(config.ICON_PNG)).scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo.setPixmap(pix)
-            logo.setToolTip(f"RealDub v{__version__} — офлайн перекладач мовлення")
+            logo.setToolTip(f"RealDub v{__version__} — автономний офлайн перекладач")
+            logo.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             top.addWidget(logo)
             top.addSpacing(2)
 
@@ -194,17 +198,18 @@ class Overlay(QWidget):
         self.b_tts = self._btn("🔊 Озвучка", True)
         self.b_tts.setToolTip("Озвучувати перекладений англійський текст голосом")
 
-        # Вибір моделі Whisper
+        # Вибір моделі Whisper (лише Medium та Small)
         self.cmb_model = QComboBox()
         self.cmb_model.setCursor(Qt.PointingHandCursor)
-        self.cmb_model.setToolTip("Модель розпізнавання мовлення Whisper (більша модель = вища точність)")
-        cur_m = self.cfg.get("whisper_model", "large-v3-turbo")
+        self.cmb_model.setToolTip("Модель розпізнавання Whisper (обидві працюють повністю офлайн)")
+        cur_m = self.cfg.get("whisper_model", "medium")
+        if cur_m not in config.WHISPER_MODELS:
+            cur_m = "medium"
         for idx, (m_key, (m_label, _)) in enumerate(config.WHISPER_MODELS.items()):
             self.cmb_model.addItem(m_label, userData=m_key)
             if m_key == cur_m:
                 self.cmb_model.setCurrentIndex(idx)
 
-        # Кнопки розміру шрифту
         b_font_down = self._btn("A−", False)
         b_font_down.setToolTip("Зменшити розмір шрифту")
         b_font_down.clicked.connect(lambda: self._change_font(-2))
@@ -231,7 +236,7 @@ class Overlay(QWidget):
         b_quit.clicked.connect(self._quit_app)
 
         self.st = QLabel("⏳ Завантаження моделей…")
-        self.st.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 500;")
+        self.st.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
         self.st.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         for w_item in (self.b_sys, self.b_mic, self.b_tts, self.cmb_model, b_font_down, b_font_up):
@@ -242,12 +247,23 @@ class Overlay(QWidget):
             top.addWidget(w_item)
         lay.addLayout(top)
 
-        # Поле субтитрів (прозоре для миші, щоб вікно легко перетягувалося за будь-яке місце)
+        # Область субтитрів з автопрокруткою вниз (працює ідеально навіть у маленькому вікні)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.scroll.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.scroll.viewport().setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
         self.text = QLabel()
         self.text.setWordWrap(True)
-        self.text.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.text.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        self.text.setStyleSheet("background: transparent;")
         self.text.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        lay.addWidget(self.text, 1)
+        self.scroll.setWidget(self.text)
+        lay.addWidget(self.scroll, 1)
 
         # Нижня панель: поле ручного вводу слова або речення + кнопка перекладу + зміна розміру
         row = QHBoxLayout()
@@ -288,6 +304,14 @@ class Overlay(QWidget):
         p.setPen(QColor(148, 163, 184, 48))
         p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render()
+
+    def _scroll_to_bottom(self):
+        vbar = self.scroll.verticalScrollBar()
+        vbar.setValue(vbar.maximum())
+
     def _change_font(self, delta: int):
         new_fs = max(14, min(36, self.cfg.get("font_size", 21) + delta))
         self.cfg["font_size"] = new_fs
@@ -298,7 +322,6 @@ class Overlay(QWidget):
     def _copy_last(self):
         if self.lines:
             _, orig, trans, _ = self.lines[-1]
-            # Прибираємо синонім після " · ", якщо копіюємо для вставки
             clean_tr = trans.split("  ·  ")[0].strip()
             QGuiApplication.clipboard().setText(clean_tr)
             self.st.setText(f"📋 Скопійовано: {clean_tr[:35]}")
@@ -366,11 +389,15 @@ class Overlay(QWidget):
             self.on_shutdown()
         _remove_pid_file()
         try:
-            subprocess.Popen(
-                [sys.executable, str(config.ROOT / "main.pyw")],
-                cwd=str(config.ROOT),
-                creationflags=_NO_WIN,
-            )
+            exe_launcher = config.ROOT / "RealDub.exe"
+            if exe_launcher.exists():
+                subprocess.Popen([str(exe_launcher)], cwd=str(config.ROOT), creationflags=_NO_WIN)
+            else:
+                subprocess.Popen(
+                    [sys.executable, str(config.ROOT / "main.pyw")],
+                    cwd=str(config.ROOT),
+                    creationflags=_NO_WIN,
+                )
         except Exception:
             pass
         os._exit(0)
@@ -408,7 +435,7 @@ class Overlay(QWidget):
             self.partial.pop(direction, None)
             if orig and trans:
                 self.lines.append((direction, orig, trans, time.time()))
-                self.lines = self.lines[-self.cfg.get("max_lines", 4):]
+                self.lines = self.lines[-self.cfg.get("max_lines", 6):]
         else:
             if orig and trans:
                 self.partial[direction] = (orig, trans)
@@ -432,31 +459,38 @@ class Overlay(QWidget):
         fs = self.cfg.get("font_size", 21)
         orig_fs = self.cfg.get("orig_font_size", max(16, fs - 3))
 
+        # Розраховуємо, скільки блоків гарантовано вміщується у поточну висоту вікна,
+        # щоб нові репліки знизу НІКОЛИ не обрізалися навіть при маленькому вікні
+        avail_h = max(60, self.height() - 102)
+        est_block_h = max(44, int((fs + orig_fs) * 1.65))
+        max_blocks = max(1, avail_h // est_block_h)
+        active_partials = [(d, o, t) for d, (o, t) in self.partial.items() if o and t]
+        keep_finals = max(1, max_blocks - len(active_partials))
+        visible_finals = self.lines[-keep_finals:] if self.lines else []
+
         def block(d, o, t, live=False):
-            op = "0.78" if live else "1.0"
+            op = "0.80" if live else "1.0"
             live_badge = "<span style='color:#fbbf24; font-size:12px; font-weight:600;'> ⚡ мовлення…</span>" if live else ""
             if d == "in":
-                # Звук ПК (EN -> UK): англійський оригінал більшим і чітким шрифтом, знизу український переклад
                 tag = "<span style='color:#38bdf8; font-weight:700;'>EN → UK</span>"
                 return (
-                    f"<div style='margin-bottom:10px; opacity:{op}; line-height:1.28;'>"
+                    f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
                     f"<span style='font-size:{orig_fs}pt; color:#cbd5e1; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
                     f"<span style='color:#ffffff; font-size:{fs}pt; font-weight:600;'>{_esc(t)}</span>"
                     f"</div>"
                 )
             else:
-                # Мікрофон або ввід тексту (UK -> EN): український оригінал зверху, англійський переклад крупним шрифтом знизу
                 tag = "<span style='color:#34d399; font-weight:700;'>UK → EN</span>"
                 en_fs = fs + 1
                 return (
-                    f"<div style='margin-bottom:10px; opacity:{op}; line-height:1.28;'>"
+                    f"<div style='margin-bottom:8px; opacity:{op}; line-height:1.25;'>"
                     f"<span style='font-size:{max(15, orig_fs - 1)}pt; color:#94a3b8; font-weight:500;'>{tag} · {_esc(o)}</span>{live_badge}<br>"
                     f"<span style='color:#68ffa8; font-size:{en_fs}pt; font-weight:600;'>{_esc(t)}</span>"
                     f"</div>"
                 )
 
-        html = "".join(block(*l[:3]) for l in self.lines)
-        html += "".join(block(d, o, t, True) for d, (o, t) in self.partial.items() if o and t)
+        html = "".join(block(*l[:3]) for l in visible_finals)
+        html += "".join(block(d, o, t, True) for d, o, t in active_partials)
         self.text.setText(
             html or (
                 f"<span style='color:#94a3b8; font-size:{max(13, fs - 5)}pt;'>"
@@ -464,6 +498,8 @@ class Overlay(QWidget):
                 f"</span>"
             )
         )
+        self._scroll_to_bottom()
+        QTimer.singleShot(0, self._scroll_to_bottom)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -530,6 +566,7 @@ class Pipeline:
         self.typed = queue.Queue()
         self._stopped = False
         self._switching_model = False
+        self._switch_lock = threading.Lock()
         mk = lambda d: Segmenter(lambda a, f: self.lanes[d].put(a, f), cfg["min_level"],
                                  cfg["silence_sec"], cfg["max_phrase_sec"], cfg["live_partial"])
         self.cap_sys = Capture("system", mk("in"), cfg)
@@ -586,7 +623,7 @@ class Pipeline:
         except Exception as e:
             self.bus.status.emit(f"❌ Помилка: {e}")
             return
-        self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {self.asr.device}")
+        self.bus.status.emit(f"✅ Whisper {self.asr.display_name} · {self.asr.device}")
         self.bus.ready.emit()
         if self.cfg.get("check_updates_on_start", True):
             threading.Thread(target=self._check_update_bg, daemon=True).start()
@@ -595,27 +632,33 @@ class Pipeline:
         threading.Thread(target=self._typed_loop, daemon=True).start()
 
     def change_whisper_model(self, new_model: str):
-        """Динамічна заміна моделі Whisper без перезапуску програми."""
-        if self._switching_model or new_model == self.cfg.get("whisper_model"):
+        """Динамічна заміна моделі Whisper (Medium <-> Small) без перезапуску програми."""
+        cur_loaded = getattr(getattr(self, "asr", None), "model_name", None)
+        if self._switching_model or new_model == cur_loaded:
             return
 
         def worker():
-            self._switching_model = True
-            try:
-                from realdub.engine import Recognizer
-                self.cfg["whisper_model"] = new_model
-                config.save(self.cfg)
-                self.bus.status.emit(f"⏳ Перемикаю на Whisper {new_model}…")
-                old_asr = getattr(self, "asr", None)
-                new_asr = Recognizer(self.cfg, on_status=self.bus.status.emit)
-                self.asr = new_asr
-                del old_asr
-                gc.collect()
-                self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {self.asr.device}")
-            except Exception as e:
-                self.bus.status.emit(f"⚠ Помилка зміни моделі: {e}")
-            finally:
-                self._switching_model = False
+            with self._switch_lock:
+                self._switching_model = True
+                try:
+                    from realdub.engine import Recognizer
+                    self.cfg["whisper_model"] = new_model
+                    config.save(self.cfg)
+                    disp = "Medium" if new_model == "medium" else "Small"
+                    self.bus.status.emit(f"⏳ Перемикаю на Whisper {disp}…")
+                    old_asr = getattr(self, "asr", None)
+                    if old_asr is not None:
+                        with old_asr.lock:
+                            self.asr = None
+                        del old_asr
+                        gc.collect()
+                    new_asr = Recognizer(self.cfg, on_status=self.bus.status.emit)
+                    self.asr = new_asr
+                    self.bus.status.emit(f"✅ Whisper {self.asr.display_name} · {self.asr.device}")
+                except Exception as e:
+                    self.bus.status.emit(f"⚠ Помилка зміни моделі: {e}")
+                finally:
+                    self._switching_model = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -647,8 +690,12 @@ class Pipeline:
                     self.bus.line.emit(d, "", "", True)
                 continue
             try:
+                if self._switching_model or getattr(self, "asr", None) is None:
+                    time.sleep(0.1)
+                    continue
                 t0 = time.time()
-                orig = self.asr(audio, "en" if d == "in" else "uk", fast=not final)
+                cur_asr = self.asr
+                orig = cur_asr(audio, "en" if d == "in" else "uk", fast=not final)
                 if not final and lane.finals:
                     continue
                 if not orig:
@@ -667,13 +714,13 @@ class Pipeline:
                         tr = mt(orig)
                 else:
                     last_partial_orig = ""
-                    # Якщо в мікрофон сказано 1-2 слова — використовуємо словниковий перекладач для точності
                     if d == "out" and len(orig.split()) <= 2 and hasattr(self, "word_tr"):
                         _, tr, speak_txt = self.word_tr.translate(orig)
                         self.bus.line.emit(d, orig, tr, True)
                         if self.ui.b_tts.isChecked() and speak_txt:
                             threading.Thread(target=self._speak, args=(speak_txt,), daemon=True).start()
-                        self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {time.time() - t0:.1f} с")
+                        if not self._switching_model:
+                            self.bus.status.emit(f"✅ Whisper {self.asr.display_name} · {time.time() - t0:.1f} с")
                         continue
                     try:
                         tr = mt(orig, fast=False)
@@ -681,10 +728,11 @@ class Pipeline:
                         tr = mt(orig)
 
                 self._emit(d, orig, tr, final)
-                if final:
-                    self.bus.status.emit(f"✅ Whisper {self.asr.model_name} · {time.time() - t0:.1f} с")
+                if final and not self._switching_model:
+                    self.bus.status.emit(f"✅ Whisper {self.asr.display_name} · {time.time() - t0:.1f} с")
             except Exception as e:
-                self.bus.status.emit(f"⚠ {e}")
+                if not self._switching_model:
+                    self.bus.status.emit(f"⚠ {e}")
 
     def _emit(self, d, orig, tr, final):
         self.bus.line.emit(d, orig, tr, final)
